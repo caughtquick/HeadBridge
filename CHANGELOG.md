@@ -21,6 +21,8 @@ All notable user-visible changes will be documented here. HeadBridge follows
   paired headphone, so a neighbour's headphones are not controlled by mistake.
 - Menu-bar popover: keep the window as tall as its content when a device's
   controls expand, instead of clipping them (seen on macOS 27).
+- Menu: `Option`-click shows the input devices every time the menu opens, and
+  pressing `Option` while it is open reveals them (seen broken on macOS 27).
 
 ## 0.1.7 - 2026-08-16
 
