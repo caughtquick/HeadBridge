@@ -23,6 +23,8 @@ All notable user-visible changes will be documented here. HeadBridge follows
   controls expand, instead of clipping them (seen on macOS 27).
 - Menu: `Option`-click shows the input devices every time the menu opens, and
   pressing `Option` while it is open reveals them (seen broken on macOS 27).
+- Protocol diagnostics: log times include seconds and milliseconds, and
+  the log can be copied or saved to a text file.
 
 ## 0.1.7 - 2026-08-16
 
