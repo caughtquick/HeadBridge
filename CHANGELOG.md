@@ -5,6 +5,26 @@ All notable user-visible changes will be documented here. HeadBridge follows
 
 ## Unreleased
 
+- Bowers & Wilkins: discover headphones that advertise over BLE under the
+  generic `LE_BWHP` name, hardware-tested with the original Px8.
+- Bowers & Wilkins: use the original Px8's ANC mode values, so Off, Noise
+  Cancellation, and Pass-Through select the correct mode.
+- Bowers & Wilkins: bass and treble sliders for headphones that have a two-band
+  tone control instead of the five-band EQ, hardware-tested with the original
+  Px8.
+- Bowers & Wilkins: confirm a changed setting only after the headphones
+  acknowledge it, and keep a confirmed control visible if a later read fails.
+  Toggling the wear sensor on an original Px8 could bounce back or make the
+  control disappear.
+- Bowers & Wilkins: for generically advertised headphones, drop the control
+  link when the headphone's reported Bluetooth address is not a connected
+  paired headphone, so a neighbour's headphones are not controlled by mistake.
+- Menu-bar popover: keep the window as tall as its content when a device's
+  controls expand, instead of clipping them (seen on macOS 27).
+- Menu: `Option`-click shows the input devices every time the menu opens, and
+  pressing `Option` while it is open reveals them (seen broken on macOS 27).
+- Protocol diagnostics: log times include seconds and milliseconds, and
+  the log can be copied or saved to a text file.
 - Optional Dock icon while the settings window is open (General → Dock).
 
 ## 0.1.7 - 2026-08-16
