@@ -25,6 +25,7 @@ All notable user-visible changes will be documented here. HeadBridge follows
   pressing `Option` while it is open reveals them (seen broken on macOS 27).
 - Protocol diagnostics: log times include seconds and milliseconds, and
   the log can be copied or saved to a text file.
+- Optional Dock icon while the settings window is open (General → Dock).
 
 ## 0.1.7 - 2026-08-16
 
