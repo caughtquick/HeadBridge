@@ -26,7 +26,8 @@ public final class LinuxCommandRunner: @unchecked Sendable {
     public func run(
         _ executable: String,
         arguments: [String],
-        allowHostFallback: Bool = true
+        allowHostFallback: Bool = true,
+        timeout: TimeInterval = 4.0
     ) -> CommandResult? {
         let process = Process()
         let outPipe = Pipe()
@@ -67,7 +68,19 @@ public final class LinuxCommandRunner: @unchecked Sendable {
                 group.leave()
             }
 
-            process.waitUntilExit()
+            let waitGroup = DispatchGroup()
+            waitGroup.enter()
+            DispatchQueue.global().async {
+                process.waitUntilExit()
+                waitGroup.leave()
+            }
+
+            let waitResult = waitGroup.wait(timeout: .now() + timeout)
+            if waitResult == .timedOut {
+                process.terminate()
+                return nil
+            }
+
             group.wait()
             let stdout = String(data: outBox.data, encoding: .utf8) ?? ""
             let stderr = String(data: errBox.data, encoding: .utf8) ?? ""

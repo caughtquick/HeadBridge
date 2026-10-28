@@ -38,46 +38,58 @@ struct LinuxApp {
         switch subcommand {
         case "status":
             handleStatus(manager: manager, audio: audio, isJSON: isJSON)
+            exit(0)
 
         case "devices":
             handleDevices(manager: manager, audio: audio, isJSON: isJSON)
+            exit(0)
 
         case "connect":
             let target = filteredArgs.count > 1 ? filteredArgs[1] : nil
             await handleConnect(target: target, manager: manager, bwTransport: bwTransport, isJSON: isJSON)
+            exit(0)
 
         case "disconnect":
             handleDisconnect(manager: manager, isJSON: isJSON)
+            exit(0)
 
         case "anc":
             let modeArg = filteredArgs.count > 1 ? filteredArgs[1] : nil
             handleANC(modeArg: modeArg, manager: manager, isJSON: isJSON)
+            exit(0)
 
         case "ambient-level":
             let levelArg = filteredArgs.count > 1 ? Int(filteredArgs[1]) : nil
             handleAmbientLevel(level: levelArg, sonyProvider: sonyProvider, isJSON: isJSON)
+            exit(0)
 
         case "eq":
             let subArgs = Array(filteredArgs.dropFirst())
             handleEQ(args: subArgs, bwProvider: bwProvider, isJSON: isJSON)
+            exit(0)
 
         case "volume":
             let action = filteredArgs.count > 1 ? filteredArgs[1] : "get"
             let value = filteredArgs.count > 2 ? Float(filteredArgs[2]) : nil
             handleVolume(action: action, value: value, audio: audio, isJSON: isJSON)
+            exit(0)
 
         case "battery":
             handleBattery(manager: manager, isJSON: isJSON)
+            exit(0)
 
         case "restore":
             let action = filteredArgs.count > 1 ? filteredArgs[1] : "status"
             handleRestore(action: action, manager: manager, isJSON: isJSON)
+            exit(0)
 
         case "monitor", "daemon":
+            audio.startMonitoring()
             await handleDaemon(manager: manager, audio: audio, bwTransport: bwTransport)
 
         case "diag":
             handleDiag(manager: manager, audio: audio, isJSON: isJSON)
+            exit(0)
 
         default:
             print("Unknown command: \(subcommand). Use 'headbridge help' for available commands.")
@@ -242,8 +254,8 @@ struct LinuxApp {
         }
 
         // Wait for connection to settle
-        for _ in 0..<10 {
-            try? await Task.sleep(nanoseconds: 300_000_000)
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 250_000_000)
             if activeProvider(manager: manager)?.connectionState == .ready {
                 break
             }
@@ -251,12 +263,14 @@ struct LinuxApp {
 
         let ready = activeProvider(manager: manager)?.connectionState == .ready
         if isJSON {
-            printJSON(["success": ready, "device": device.name, "address": device.address])
+            printJSON(["success": ready, "device": device.name, "address": device.address, "vendorRPCReady": ready])
         } else {
             if ready {
-                print("Successfully connected to \(device.name)!")
+                print("Successfully connected to \(device.name) vendor RPC!")
             } else {
-                print("Connection in progress or pending.")
+                print("Audio and Battery are connected via BlueZ.")
+                print("Vendor GATT RPC control session is not currently active.")
+                print("Bowers & Wilkins headphones broadcast their ANC/EQ GATT controls over their companion BLE interface ('LE_BWHP').")
             }
         }
     }

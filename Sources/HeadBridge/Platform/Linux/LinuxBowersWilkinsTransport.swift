@@ -51,8 +51,7 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
         // 1. Resolve GATT characteristics via BlueZ ObjectManager
         guard resolveCharacteristics(macSegment: macSegment) else {
             // Attempt to connect device if not connected yet
-            _ = runner.run("bluetoothctl", arguments: ["connect", address])
-            Thread.sleep(forTimeInterval: 0.5)
+            _ = runner.run("bluetoothctl", arguments: ["connect", address], timeout: 3.0)
 
             guard resolveCharacteristics(macSegment: macSegment) else {
                 onLog?(.incoming, "Failed to resolve Bowers & Wilkins GATT characteristics for \(address)")
@@ -65,7 +64,7 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
         enableNotificationsAndStartMonitoring()
     }
 
-    private func resolveCharacteristics(macSegment: String) -> Bool {
+    private func resolveCharacteristics(macSegment: String? = nil) -> Bool {
         guard let result = runner.run("busctl", arguments: ["call", "--json=short", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]),
               result.exitCode == 0,
               let jsonData = result.stdout.data(using: .utf8),
@@ -79,21 +78,48 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
         let responseUUID = BWRPC.responseUUID.lowercased()
         let notificationUUID = BWRPC.notificationUUID.lowercased()
 
-        for (path, val) in objects {
-            guard path.contains("dev_\(macSegment)") else { continue }
-            guard let interfaces = val as? [String: Any],
-                  let gattChar = interfaces["org.bluez.GattCharacteristic1"] as? [String: Any],
-                  let uuidObj = gattChar["UUID"] as? [String: Any],
-                  let uuid = (uuidObj["data"] as? String)?.lowercased() else {
-                continue
-            }
+        requestCharPath = nil
+        responseCharPath = nil
+        notificationCharPath = nil
 
-            if uuid == requestUUID {
-                requestCharPath = path
-            } else if uuid == responseUUID {
-                responseCharPath = path
-            } else if uuid == notificationUUID {
-                notificationCharPath = path
+        // First pass: try matching the specific device macSegment if provided
+        if let macSegment = macSegment {
+            for (path, val) in objects {
+                guard path.contains("dev_\(macSegment)") else { continue }
+                guard let interfaces = val as? [String: Any],
+                      let gattChar = interfaces["org.bluez.GattCharacteristic1"] as? [String: Any],
+                      let uuidObj = gattChar["UUID"] as? [String: Any],
+                      let uuid = (uuidObj["data"] as? String)?.lowercased() else {
+                    continue
+                }
+
+                if uuid == requestUUID {
+                    requestCharPath = path
+                } else if uuid == responseUUID {
+                    responseCharPath = path
+                } else if uuid == notificationUUID {
+                    notificationCharPath = path
+                }
+            }
+        }
+
+        // Second pass: if not found, find any device with the unique BWRPC characteristics (e.g. companion LE_BWHP broadcast)
+        if requestCharPath == nil || responseCharPath == nil {
+            for (path, val) in objects {
+                guard let interfaces = val as? [String: Any],
+                      let gattChar = interfaces["org.bluez.GattCharacteristic1"] as? [String: Any],
+                      let uuidObj = gattChar["UUID"] as? [String: Any],
+                      let uuid = (uuidObj["data"] as? String)?.lowercased() else {
+                    continue
+                }
+
+                if uuid == requestUUID {
+                    requestCharPath = path
+                } else if uuid == responseUUID {
+                    responseCharPath = path
+                } else if uuid == notificationUUID {
+                    notificationCharPath = path
+                }
             }
         }
 
@@ -101,13 +127,33 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
     }
 
     private func enableNotificationsAndStartMonitoring() {
-        if let respPath = responseCharPath {
-            _ = runner.run("busctl", arguments: ["call", "org.bluez", respPath, "org.bluez.GattCharacteristic1", "StartNotify"])
-            onLog?(.outgoing, "Enabled notifications on response characteristic: \(respPath)")
+        guard let respPath = responseCharPath else {
+            transition(to: .idle)
+            return
         }
 
+        // Check if device is connected before enabling notifications
+        let parts = respPath.split(separator: "/")
+        if parts.count >= 4 {
+            let devPath = "/" + parts[0...2].joined(separator: "/")
+            if let isConn = runner.run("busctl", arguments: ["get-property", "org.bluez", devPath, "org.bluez.Device1", "Connected"], timeout: 2.0) {
+                if !isConn.stdout.contains("true") {
+                    onLog?(.outgoing, "Connecting LE device link: \(devPath)")
+                    _ = runner.run("busctl", arguments: ["--timeout=3", "call", "org.bluez", devPath, "org.bluez.Device1", "Connect"], timeout: 3.5)
+                }
+            }
+        }
+
+        let respResult = runner.run("busctl", arguments: ["--timeout=3", "call", "org.bluez", respPath, "org.bluez.GattCharacteristic1", "StartNotify"], timeout: 3.5)
+        guard respResult?.exitCode == 0 else {
+            onLog?(.incoming, "Failed or timed out starting notifications on \(respPath)")
+            transition(to: .idle)
+            return
+        }
+        onLog?(.outgoing, "Enabled notifications on response characteristic: \(respPath)")
+
         if let notifPath = notificationCharPath {
-            _ = runner.run("busctl", arguments: ["call", "org.bluez", notifPath, "org.bluez.GattCharacteristic1", "StartNotify"])
+            _ = runner.run("busctl", arguments: ["--timeout=3", "call", "org.bluez", notifPath, "org.bluez.GattCharacteristic1", "StartNotify"], timeout: 3.5)
             onLog?(.outgoing, "Enabled notifications on notification characteristic: \(notifPath)")
         }
 
@@ -162,10 +208,10 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
         monitorProcess = nil
 
         if let respPath = responseCharPath {
-            _ = runner.run("busctl", arguments: ["call", "org.bluez", respPath, "org.bluez.GattCharacteristic1", "StopNotify"])
+            _ = runner.run("busctl", arguments: ["--timeout=2", "call", "org.bluez", respPath, "org.bluez.GattCharacteristic1", "StopNotify"], timeout: 2.5)
         }
         if let notifPath = notificationCharPath {
-            _ = runner.run("busctl", arguments: ["call", "org.bluez", notifPath, "org.bluez.GattCharacteristic1", "StopNotify"])
+            _ = runner.run("busctl", arguments: ["--timeout=2", "call", "org.bluez", notifPath, "org.bluez.GattCharacteristic1", "StopNotify"], timeout: 2.5)
         }
 
         requestCharPath = nil
@@ -184,7 +230,7 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
             return false
         }
 
-        var args = ["call", "org.bluez", reqPath, "org.bluez.GattCharacteristic1", "WriteValue", "aya{sv}", "\(data.count)"]
+        var args = ["--timeout=3", "call", "org.bluez", reqPath, "org.bluez.GattCharacteristic1", "WriteValue", "aya{sv}", "\(data.count)"]
         for byte in data {
             args.append("\(byte)")
         }
@@ -193,7 +239,7 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
         let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
         onLog?(.outgoing, "BWRPC request: \(hex)")
 
-        guard let result = runner.run("busctl", arguments: args), result.exitCode == 0 else {
+        guard let result = runner.run("busctl", arguments: args, timeout: 3.5), result.exitCode == 0 else {
             onLog?(.incoming, "Failed to write BWRPC request to \(reqPath)")
             return false
         }

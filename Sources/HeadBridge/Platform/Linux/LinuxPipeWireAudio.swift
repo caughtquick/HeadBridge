@@ -25,10 +25,12 @@ public final class LinuxPipeWireAudio: ObservableObject, AudioControllerProtocol
     private let runner: LinuxCommandRunner
     private var monitorProcess: Process?
 
-    public init(runner: LinuxCommandRunner = .shared) {
+    public init(runner: LinuxCommandRunner = .shared, startMonitoring: Bool = false) {
         self.runner = runner
         refresh()
-        startEventMonitor()
+        if startMonitoring {
+            startEventMonitor()
+        }
     }
 
     deinit {
@@ -202,6 +204,10 @@ public final class LinuxPipeWireAudio: ObservableObject, AudioControllerProtocol
     public func shutdown() {
         monitorProcess?.terminate()
         monitorProcess = nil
+    }
+
+    public func startMonitoring() {
+        startEventMonitor()
     }
 
     private func startEventMonitor() {
