@@ -35,6 +35,19 @@ enum BWRPCError: Error, LocalizedError {
 }
 
 enum BWRPC {
+    static let requestUUIDs = [
+        "ada50ce9-67b8-4a97-9d8e-37e1d083156c",
+        "fe2c1234-8366-4814-8eb0-01de32100bea"
+    ]
+    static let responseUUIDs = [
+        "cb909093-3559-4b0c-9a7f-3f1773122fdc",
+        "fe2c1235-8366-4814-8eb0-01de32100bea"
+    ]
+    static let notificationUUIDs = [
+        "df55d475-9a32-457a-9e20-38cf14e853fb",
+        "fe2c1236-8366-4814-8eb0-01de32100bea"
+    ]
+
     static let requestUUID = "ada50ce9-67b8-4a97-9d8e-37e1d083156c"
     static let responseUUID = "cb909093-3559-4b0c-9a7f-3f1773122fdc"
     static let notificationUUID = "df55d475-9a32-457a-9e20-38cf14e853fb"

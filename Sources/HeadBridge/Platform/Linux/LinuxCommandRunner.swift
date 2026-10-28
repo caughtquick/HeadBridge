@@ -114,26 +114,28 @@ public final class LinuxCommandRunner: @unchecked Sendable {
             return nil
         }
 
-        final class LineBuffer: @unchecked Sendable {
-            var text = ""
-        }
-        let lineBuffer = LineBuffer()
-
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            if let chunk = String(data: data, encoding: .utf8) {
-                lineBuffer.text += chunk
-                while let newlineRange = lineBuffer.text.range(of: "\n") {
-                    let line = String(lineBuffer.text[..<newlineRange.lowerBound])
-                    lineBuffer.text.removeSubrange(...newlineRange.lowerBound)
-                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        onLine(trimmed)
+        let readFd = pipe.fileHandleForReading.fileDescriptor
+        let readerThread = Thread {
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            var lineData = Data()
+            while true {
+                let bytesRead = read(readFd, &buffer, buffer.count)
+                if bytesRead <= 0 { break }
+                for i in 0..<bytesRead {
+                    let b = buffer[i]
+                    if b == 0x0A {
+                        if let line = String(data: lineData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
+                            onLine(line)
+                        }
+                        lineData.removeAll(keepingCapacity: true)
+                    } else if b != 0x0D {
+                        lineData.append(b)
                     }
                 }
             }
         }
+        readerThread.name = "com.headbridge.spawn.reader.\(executable)"
+        readerThread.start()
 
         do {
             try process.run()

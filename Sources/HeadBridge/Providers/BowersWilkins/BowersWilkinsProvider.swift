@@ -1844,22 +1844,20 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
                 return
             }
             for characteristic in service.characteristics ?? [] {
-                switch characteristic.uuid.uuidString.lowercased() {
-                case BWRPC.requestUUID:
+                let uuid = characteristic.uuid.uuidString.lowercased()
+                if BWRPC.requestUUIDs.contains(uuid) {
                     requestCharacteristic = characteristic
                     transportReadiness.requestDiscovered = true
-                case BWRPC.responseUUID:
+                } else if BWRPC.responseUUIDs.contains(uuid) {
                     guard responseCharacteristic !== characteristic else { continue }
                     responseCharacteristic = characteristic
                     transportReadiness.responseDiscovered = true
                     transportReadiness.responseNotificationsConfirmed = false
                     callbackPeripheral.setNotifyValue(true, for: characteristic)
-                case BWRPC.notificationUUID:
+                } else if BWRPC.notificationUUIDs.contains(uuid) {
                     guard eventCharacteristic !== characteristic else { continue }
                     eventCharacteristic = characteristic
                     callbackPeripheral.setNotifyValue(true, for: characteristic)
-                default:
-                    break
                 }
             }
             transportMayBeReady()

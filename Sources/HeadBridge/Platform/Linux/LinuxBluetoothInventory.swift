@@ -16,9 +16,55 @@ public final class LinuxBluetoothInventory: BluetoothInventoryService, @unchecke
         fetchViaBluetoothctl()
     }
 
-    public func fetchBatteryPercentage(for address: String) -> Int? {
+    public static func findDefaultAdapterPath(runner: LinuxCommandRunner = .shared) -> String {
+        shared.findDefaultAdapterPath()
+    }
+
+    public func findDefaultAdapterPath() -> String {
+        if let result = runner.run("busctl", arguments: ["call", "--json=short", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]),
+           result.exitCode == 0,
+           let jsonData = result.stdout.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+           let payload = json["data"] as? [[String: Any]],
+           let objects = payload.first {
+            var fallbackAdapter: String?
+            for (path, val) in objects {
+                guard let ifaces = val as? [String: Any],
+                      let adapter = ifaces["org.bluez.Adapter1"] as? [String: Any] else {
+                    continue
+                }
+                if fallbackAdapter == nil { fallbackAdapter = path }
+                let powered = (adapter["Powered"] as? [String: Any])?["data"] as? Bool ?? false
+                if powered { return path }
+            }
+            if let fallback = fallbackAdapter { return fallback }
+        }
+        return "/org/bluez/hci0"
+    }
+
+    public func findDevicePath(for address: String) -> String? {
+        if let result = runner.run("busctl", arguments: ["call", "--json=short", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]),
+           result.exitCode == 0,
+           let jsonData = result.stdout.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+           let payload = json["data"] as? [[String: Any]],
+           let objects = payload.first {
+            for (path, val) in objects {
+                if let ifaces = val as? [String: Any],
+                   let dev = ifaces["org.bluez.Device1"] as? [String: Any],
+                   let devAddr = (dev["Address"] as? [String: Any])?["data"] as? String,
+                   devAddr.caseInsensitiveCompare(address) == .orderedSame {
+                    return path
+                }
+            }
+        }
         let macSegment = address.replacingOccurrences(of: ":", with: "_").uppercased()
-        let path = "/org/bluez/hci0/dev_\(macSegment)"
+        let adapter = findDefaultAdapterPath()
+        return "\(adapter)/dev_\(macSegment)"
+    }
+
+    public func fetchBatteryPercentage(for address: String) -> Int? {
+        guard let path = findDevicePath(for: address) else { return nil }
         guard let result = runner.run("busctl", arguments: ["get-property", "org.bluez", path, "org.bluez.Battery1", "Percentage"]),
               result.exitCode == 0 else {
             return nil

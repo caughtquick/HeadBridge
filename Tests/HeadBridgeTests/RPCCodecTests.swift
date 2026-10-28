@@ -984,6 +984,27 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertTrue(SonyV1OptimizerStatus.analyzing.isRunning)
         XCTAssertFalse(SonyV1OptimizerStatus.finished.isRunning)
     }
+
+#if os(Linux)
+    @MainActor
+    private static func dummyMainActorPing() async -> LinuxIPCResponse {
+        return LinuxIPCResponse(exitCode: 0, output: "pong\n")
+    }
+
+    func testLinuxDaemonIPCPing() async {
+        let sockPath = "/tmp/test-headbridge-\(UUID().uuidString).sock"
+        let server = LinuxDaemonServer(socketPath: sockPath)
+        server.requestHandler = { req in
+            return await Self.dummyMainActorPing()
+        }
+        XCTAssertTrue(server.start())
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let resp = LinuxDaemonClient.sendCommand(args: ["ping"], isJSON: false, socketPath: sockPath)
+        XCTAssertEqual(resp?.output, "pong\n")
+        server.stop()
+    }
+#endif
 }
 
 @MainActor

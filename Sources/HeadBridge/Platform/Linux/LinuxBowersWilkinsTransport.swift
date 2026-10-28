@@ -30,40 +30,58 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
 
     func startScan() {
         onLog?(.outgoing, "Starting Bluetooth LE scan")
-        _ = runner.run("busctl", arguments: ["call", "--timeout=2", "org.bluez", "/org/bluez/hci0", "org.bluez.Adapter1", "StartDiscovery"])
+        let adapter = LinuxBluetoothInventory.findDefaultAdapterPath(runner: runner)
+        _ = runner.run("busctl", arguments: ["call", "--timeout=2", "org.bluez", adapter, "org.bluez.Adapter1", "StartDiscovery"])
     }
 
     func stopScan() {
         onLog?(.outgoing, "Stopping Bluetooth LE scan")
-        _ = runner.run("busctl", arguments: ["call", "--timeout=2", "org.bluez", "/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery"])
+        let adapter = LinuxBluetoothInventory.findDefaultAdapterPath(runner: runner)
+        _ = runner.run("busctl", arguments: ["call", "--timeout=2", "org.bluez", adapter, "org.bluez.Adapter1", "StopDiscovery"])
     }
+
+    private let connectionQueue = DispatchQueue(label: "com.headbridge.bw.connection", qos: .userInitiated)
+    private var generation: UInt64 = 0
 
     func connect(address: String, name: String) {
         guard connectionState != .ready && connectionState != .connecting else { return }
 
-        transition(to: .connecting)
+        generation &+= 1
+        let currentGen = generation
+
         connectedDeviceAddress = address
         connectedDeviceName = name
+        transition(to: .connecting)
         onLog?(.outgoing, "Connecting to \(name) (\(address)) via BlueZ GATT")
 
-        let macSegment = address.replacingOccurrences(of: ":", with: "_").uppercased()
+        let currentRunner = runner
+        connectionQueue.async { [weak self] in
+            let macSegment = address.replacingOccurrences(of: ":", with: "_").uppercased()
 
-        // 1. Resolve GATT characteristics via BlueZ ObjectManager
-        if !resolveCharacteristics(macSegment: macSegment) {
-            connectCompanionLEDevice()
-            _ = resolveCharacteristics(macSegment: macSegment)
+            var resolved = Self.resolveCharacteristics(macSegment: macSegment, runner: currentRunner)
+            if resolved == nil {
+                Self.connectCompanionLEDevice(runner: currentRunner)
+                resolved = Self.resolveCharacteristics(macSegment: macSegment, runner: currentRunner)
+            }
+
+            Task { @MainActor [weak self] in
+                guard let self = self, self.generation == currentGen else { return }
+
+                guard let chars = resolved else {
+                    self.onLog?(.incoming, "Failed to resolve Bowers & Wilkins GATT characteristics for \(address)")
+                    self.transition(to: .idle)
+                    return
+                }
+
+                self.requestCharPath = chars.requestPath
+                self.responseCharPath = chars.responsePath
+                self.notificationCharPath = chars.notificationPath
+                self.enableNotificationsAndStartMonitoring(generation: currentGen)
+            }
         }
-
-        guard requestCharPath != nil && responseCharPath != nil else {
-            onLog?(.incoming, "Failed to resolve Bowers & Wilkins GATT characteristics for \(address)")
-            transition(to: .idle)
-            return
-        }
-
-        enableNotificationsAndStartMonitoring()
     }
 
-    private func connectCompanionLEDevice() {
+    nonisolated private static func connectCompanionLEDevice(runner: LinuxCommandRunner) {
         guard let result = runner.run("busctl", arguments: ["call", "--json=short", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]),
               result.exitCode == 0,
               let jsonData = result.stdout.data(using: .utf8),
@@ -88,27 +106,14 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
             }
         }
 
-        // If not found in current inventory, run brief discovery scan
+        // If not found in current inventory, run brief LE discovery scan
         if leDevicePath == nil {
-            _ = runner.run("busctl", arguments: ["call", "--timeout=2", "org.bluez", "/org/bluez/hci0", "org.bluez.Adapter1", "StartDiscovery"])
-            Thread.sleep(forTimeInterval: 2.0)
-            _ = runner.run("busctl", arguments: ["call", "--timeout=2", "org.bluez", "/org/bluez/hci0", "org.bluez.Adapter1", "StopDiscovery"])
-
-            if let postScan = runner.run("busctl", arguments: ["call", "--json=short", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]),
-               let postData = postScan.stdout.data(using: .utf8),
-               let postJson = try? JSONSerialization.jsonObject(with: postData) as? [String: Any],
-               let postPayload = postJson["data"] as? [[String: Any]],
-               let postObjects = postPayload.first {
-                for (path, val) in postObjects {
-                    guard let interfaces = val as? [String: Any],
-                          let dev = interfaces["org.bluez.Device1"] as? [String: Any] else { continue }
-                    let devName = (dev["Name"] as? [String: Any])?["data"] as? String
-                        ?? (dev["Alias"] as? [String: Any])?["data"] as? String
-                        ?? ""
-                    if devName == "LE_BWHP" || devName.contains("BW") {
-                        leDevicePath = path
-                        break
-                    }
+            let adapter = LinuxBluetoothInventory.findDefaultAdapterPath(runner: runner)
+            if let scanResult = runner.run("python3", arguments: ["-c", Self.leScanScript, adapter], timeout: 3.5),
+               scanResult.exitCode == 0 {
+                let detectedPath = scanResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                if detectedPath.hasPrefix("/org/bluez") {
+                    leDevicePath = detectedPath
                 }
             }
         }
@@ -127,23 +132,32 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
         }
     }
 
-    private func resolveCharacteristics(macSegment: String? = nil) -> Bool {
+    private struct ResolvedCharacteristics: Sendable {
+        let requestPath: String
+        let responsePath: String
+        let notificationPath: String?
+    }
+
+    nonisolated private static func resolveCharacteristics(
+        macSegment: String? = nil,
+        runner: LinuxCommandRunner
+    ) -> ResolvedCharacteristics? {
         guard let result = runner.run("busctl", arguments: ["call", "--json=short", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]),
               result.exitCode == 0,
               let jsonData = result.stdout.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
               let payload = json["data"] as? [[String: Any]],
               let objects = payload.first else {
-            return false
+            return nil
         }
 
-        let requestUUID = BWRPC.requestUUID.lowercased()
-        let responseUUID = BWRPC.responseUUID.lowercased()
-        let notificationUUID = BWRPC.notificationUUID.lowercased()
+        let requestUUIDs = Set(BWRPC.requestUUIDs.map { $0.lowercased() })
+        let responseUUIDs = Set(BWRPC.responseUUIDs.map { $0.lowercased() })
+        let notificationUUIDs = Set(BWRPC.notificationUUIDs.map { $0.lowercased() })
 
-        requestCharPath = nil
-        responseCharPath = nil
-        notificationCharPath = nil
+        var req: String?
+        var resp: String?
+        var notif: String?
 
         // First pass: match specific device macSegment if provided
         if let macSegment = macSegment {
@@ -156,18 +170,14 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
                     continue
                 }
 
-                if uuid == requestUUID {
-                    requestCharPath = path
-                } else if uuid == responseUUID {
-                    responseCharPath = path
-                } else if uuid == notificationUUID {
-                    notificationCharPath = path
-                }
+                if requestUUIDs.contains(uuid) { req = path }
+                else if responseUUIDs.contains(uuid) { resp = path }
+                else if notificationUUIDs.contains(uuid) { notif = path }
             }
         }
 
         // Second pass: match companion LE device exposing BWRPC characteristics
-        if requestCharPath == nil || responseCharPath == nil {
+        if req == nil || resp == nil {
             for (path, val) in objects {
                 guard let interfaces = val as? [String: Any],
                       let gattChar = interfaces["org.bluez.GattCharacteristic1"] as? [String: Any],
@@ -176,20 +186,66 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
                     continue
                 }
 
-                if uuid == requestUUID {
-                    requestCharPath = path
-                } else if uuid == responseUUID {
-                    responseCharPath = path
-                } else if uuid == notificationUUID {
-                    notificationCharPath = path
-                }
+                if requestUUIDs.contains(uuid) { req = path }
+                else if responseUUIDs.contains(uuid) { resp = path }
+                else if notificationUUIDs.contains(uuid) { notif = path }
             }
         }
 
-        return requestCharPath != nil && responseCharPath != nil
+        guard let r = req, let s = resp else { return nil }
+        return ResolvedCharacteristics(requestPath: r, responsePath: s, notificationPath: notif)
     }
 
-    private static let gattBridgeScript = """
+    nonisolated private static let leScanScript = """
+    import sys
+    from gi.repository import Gio, GLib
+
+    adapter_path = sys.argv[1] if len(sys.argv) > 1 else '/org/bluez/hci0'
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    loop = GLib.MainLoop()
+
+    found = None
+
+    def on_signal(conn, sender, path, iface, signal, params, user_data):
+        global found
+        if signal == 'InterfacesAdded':
+            obj_path = params.get_child_value(0).get_string()
+            ifaces = params.get_child_value(1)
+            for i in range(ifaces.n_children()):
+                entry = ifaces.get_child_value(i)
+                if entry.get_child_value(0).get_string() == 'org.bluez.Device1':
+                    props = entry.get_child_value(1)
+                    for j in range(props.n_children()):
+                        p = props.get_child_value(j)
+                        p_name = p.get_child_value(0).get_string()
+                        if p_name in ('Name', 'Alias'):
+                            val = p.get_child_value(1).get_variant().get_string()
+                            if 'BW' in val or 'LE_' in val:
+                                found = obj_path
+                                loop.quit()
+
+    bus.signal_subscribe('org.bluez', 'org.freedesktop.DBus.ObjectManager', 'InterfacesAdded', None, None, Gio.DBusSignalFlags.NONE, on_signal, None)
+
+    try:
+        filter_dict = {'Transport': GLib.Variant('s', 'le')}
+        bus.call_sync('org.bluez', adapter_path, 'org.bluez.Adapter1', 'SetDiscoveryFilter', GLib.Variant('(a{sv})', [filter_dict]), None, Gio.DBusCallFlags.NONE, 2000)
+        bus.call_sync('org.bluez', adapter_path, 'org.bluez.Adapter1', 'StartDiscovery', None, None, Gio.DBusCallFlags.NONE, 2000)
+    except:
+        pass
+
+    GLib.timeout_add_seconds(2, loop.quit)
+    loop.run()
+
+    try:
+        bus.call_sync('org.bluez', adapter_path, 'org.bluez.Adapter1', 'StopDiscovery', None, None, Gio.DBusCallFlags.NONE, 2000)
+    except:
+        pass
+
+    if found:
+        print(found)
+    """
+
+    nonisolated private static let gattBridgeScript = """
     import sys, threading
     from gi.repository import Gio, GLib
 
@@ -214,18 +270,39 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
 
     bus.signal_subscribe(None, 'org.freedesktop.DBus.Properties', 'PropertiesChanged', None, None, Gio.DBusSignalFlags.NONE, on_signal, None)
 
-    bus.call_sync('org.bluez', resp_path, 'org.bluez.GattCharacteristic1', 'StartNotify', None, None, Gio.DBusCallFlags.NONE, -1, None)
+    try:
+        bus.call_sync('org.bluez', resp_path, 'org.bluez.GattCharacteristic1', 'StartNotify', None, None, Gio.DBusCallFlags.NONE, 2000, None)
+    except Exception as e:
+        sys.stderr.write(f"StartNotify resp error: {e}\\n")
+        sys.stderr.flush()
+
     if notif_path != 'none':
-        bus.call_sync('org.bluez', notif_path, 'org.bluez.GattCharacteristic1', 'StartNotify', None, None, Gio.DBusCallFlags.NONE, -1, None)
+        try:
+            bus.call_sync('org.bluez', notif_path, 'org.bluez.GattCharacteristic1', 'StartNotify', None, None, Gio.DBusCallFlags.NONE, 2000, None)
+        except Exception as e:
+            sys.stderr.write(f"StartNotify notif error: {e}\\n")
+            sys.stderr.flush()
+
+    def do_write(payload):
+        try:
+            bus.call_sync('org.bluez', req_path, 'org.bluez.GattCharacteristic1', 'WriteValue', payload, None, Gio.DBusCallFlags.NONE, 2000, None)
+        except Exception as e:
+            sys.stderr.write(f"WriteValue error: {e}\\n")
+            sys.stderr.flush()
+        return False
 
     def stdin_worker():
         for line in sys.stdin:
             line = line.strip()
             if not line: continue
             if line.startswith('WRITE '):
-                raw = bytes.fromhex(line[6:])
-                payload = GLib.Variant('(aya{sv})', (list(raw), {}))
-                GLib.idle_add(lambda p=payload: bus.call_sync('org.bluez', req_path, 'org.bluez.GattCharacteristic1', 'WriteValue', p, None, Gio.DBusCallFlags.NONE, -1, None))
+                try:
+                    raw = bytes.fromhex(line[6:])
+                    payload = GLib.Variant('(aya{sv})', (list(raw), {}))
+                    GLib.idle_add(do_write, payload)
+                except Exception as e:
+                    sys.stderr.write(f"Write parse error: {e}\\n")
+                    sys.stderr.flush()
             elif line == 'QUIT':
                 break
         GLib.idle_add(loop.quit)
@@ -238,12 +315,13 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
     loop.run()
     """
 
-    private func enableNotificationsAndStartMonitoring() {
+    private func enableNotificationsAndStartMonitoring(generation currentGen: UInt64) {
         guard let respPath = responseCharPath, let reqPath = requestCharPath else {
             transition(to: .idle)
             return
         }
 
+        monitorProcess?.terminationHandler = nil
         monitorProcess?.terminate()
         monitorProcess = nil
         stdinPipe = nil
@@ -258,23 +336,20 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
             stdinPipe: pipe
         ) { [weak self] line in
             guard let self else { return }
-            if line == "READY" {
-                DispatchQueue.main.async {
+            Task { @MainActor in
+                guard self.generation == currentGen else { return }
+                if line == "READY" {
                     self.transition(to: .ready)
                     self.onLog?(.incoming, "Connected to Bowers & Wilkins device via BlueZ GATT")
-                }
-            } else if line.hasPrefix("RESP ") {
-                let hex = String(line.dropFirst(5))
-                if let data = Self.parseHex(hex) {
-                    DispatchQueue.main.async {
+                } else if line.hasPrefix("RESP ") {
+                    let hex = String(line.dropFirst(5))
+                    if let data = Self.parseHex(hex) {
                         self.onLog?(.incoming, "BWRPC response: \(data.map { String(format: "%02X", $0) }.joined(separator: " "))")
                         self.onResponseData?(data)
                     }
-                }
-            } else if line.hasPrefix("NOTIF ") {
-                let hex = String(line.dropFirst(6))
-                if let data = Self.parseHex(hex) {
-                    DispatchQueue.main.async {
+                } else if line.hasPrefix("NOTIF ") {
+                    let hex = String(line.dropFirst(6))
+                    if let data = Self.parseHex(hex) {
                         self.onLog?(.incoming, "BWRPC notification: \(data.map { String(format: "%02X", $0) }.joined(separator: " "))")
                         self.onNotificationData?(data)
                     }
@@ -282,16 +357,32 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
             }
         }
 
-        if proc == nil {
+        guard let proc = proc else {
             onLog?(.incoming, "Failed to launch GATT bridge helper")
             transition(to: .idle)
             return
+        }
+
+        proc.terminationHandler = { [weak self] process in
+            Task { @MainActor in
+                guard let self = self else { return }
+                guard self.generation == currentGen else { return }
+                if self.monitorProcess == process {
+                    self.monitorProcess = nil
+                    self.stdinPipe = nil
+                    if self.connectionState != .idle {
+                        self.transition(to: .idle)
+                        self.onLog?(.incoming, "GATT bridge helper exited (status: \(process.terminationStatus))")
+                    }
+                }
+            }
         }
 
         monitorProcess = proc
     }
 
     func disconnect() {
+        generation &+= 1
         if let stdinPipe = stdinPipe {
             if let quitData = "QUIT\n".data(using: .utf8) {
                 try? stdinPipe.fileHandleForWriting.write(contentsOf: quitData)
@@ -299,6 +390,7 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
             self.stdinPipe = nil
         }
 
+        monitorProcess?.terminationHandler = nil
         monitorProcess?.terminate()
         monitorProcess = nil
 

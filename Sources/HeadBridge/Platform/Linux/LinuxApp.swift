@@ -1,10 +1,20 @@
 #if os(Linux)
+#if canImport(Glibc)
+import Glibc
+#endif
+#if canImport(Combine)
+import Combine
+#endif
 import Foundation
 
 @main
 @MainActor
 struct LinuxApp {
+    private static var runningServer: LinuxDaemonServer?
+    private static var autoConnectCancellable: AnyCancellable?
+
     static func main() async {
+        signal(SIGPIPE, SIG_IGN)
         let args = Array(CommandLine.arguments.dropFirst())
         let isJSON = args.contains("--json")
         let isVerbose = args.contains("--verbose") || args.contains("-v")
@@ -16,6 +26,45 @@ struct LinuxApp {
             return
         }
 
+        // 1. If this is a daemon control command (status/stop/start), handle via IPC client
+        if subcommand == "daemon" || subcommand == "monitor" {
+            if filteredArgs.contains("status") {
+                if LinuxDaemonClient.isDaemonRunning() {
+                    print("HeadBridge daemon is running (socket: \(LinuxDaemonClient.defaultSocketPath))")
+                    exit(0)
+                } else {
+                    print("HeadBridge daemon is not running.")
+                    exit(1)
+                }
+            } else if filteredArgs.contains("stop") {
+                if let response = LinuxDaemonClient.sendCommand(args: ["daemon", "stop"], isJSON: isJSON) {
+                    if !response.output.isEmpty { fputs(response.output, stdout) }
+                    exit(response.exitCode)
+                } else {
+                    print("HeadBridge daemon is not running.")
+                    exit(1)
+                }
+            } else if LinuxDaemonClient.isDaemonRunning() {
+                if isJSON {
+                    print("{\"running\":true,\"socket\":\"\(LinuxDaemonClient.defaultSocketPath)\"}")
+                } else {
+                    print("HeadBridge daemon is already running (socket: \(LinuxDaemonClient.defaultSocketPath))")
+                }
+                exit(0)
+            }
+        } else {
+            // 2. For any other command, check if daemon is running and dispatch via IPC
+            if let response = LinuxDaemonClient.sendCommand(args: args, isJSON: isJSON) {
+                if !response.output.isEmpty {
+                    fputs(response.output, response.exitCode == 0 ? stdout : stderr)
+                }
+                exit(response.exitCode)
+            } else if LinuxDaemonClient.isDaemonRunning() {
+                fputs("Warning: Daemon is running but did not respond to IPC request.\n", stderr)
+            }
+        }
+
+        // 3. Fallback: Standalone execution (daemon not running)
         let audio = LinuxPipeWireAudio()
         let bwTransport = LinuxBowersWilkinsTransport()
         let bwProvider = BowersWilkinsProvider(transport: bwTransport)
@@ -39,10 +88,60 @@ struct LinuxApp {
         }
         manager.refreshAll()
 
-        if subcommand != "disconnect",
+        if subcommand == "daemon" || subcommand == "monitor" {
+            audio.startMonitoring()
+            await handleDaemon(
+                manager: manager,
+                audio: audio,
+                bwTransport: bwTransport,
+                bwProvider: bwProvider,
+                sonyProvider: sonyProvider
+            )
+            return
+        }
+
+        let response = await dispatchCommand(
+            args: args,
+            isJSON: isJSON,
+            manager: manager,
+            audio: audio,
+            bwTransport: bwTransport,
+            bwProvider: bwProvider,
+            sonyProvider: sonyProvider
+        )
+
+        if !response.output.isEmpty {
+            fputs(response.output, response.exitCode == 0 ? stdout : stderr)
+        }
+        exit(response.exitCode)
+    }
+
+    private static func activeProvider(manager: HeadphoneManager) -> (any HeadphoneProvider)? {
+        manager.providers.first { $0.connectionState == .ready }
+            ?? manager.providers.first { $0.connectionState == .connecting }
+    }
+
+    private static func dispatchCommand(
+        args: [String],
+        isJSON: Bool,
+        manager: HeadphoneManager,
+        audio: LinuxPipeWireAudio,
+        bwTransport: LinuxBowersWilkinsTransport,
+        bwProvider: BowersWilkinsProvider,
+        sonyProvider: SonyMDRProvider
+    ) async -> LinuxIPCResponse {
+        let filteredArgs = args.filter { $0 != "--json" && $0 != "--verbose" && $0 != "-v" }
+        let subcommand = filteredArgs.first ?? "status"
+
+        // Ensure active provider connection if headphone is connected to OS
+        let requiresActiveProvider = (subcommand == "status" || subcommand == "anc" || subcommand == "eq" || subcommand == "ambient-level")
+        if requiresActiveProvider,
+           activeProvider(manager: manager)?.connectionState != .ready,
            let connectedDev = manager.recognizedDevices.first(where: { $0.isConnected }) {
-            if connectedDev.providerID == "bowers-wilkins" {
+            if connectedDev.providerID == "bowers-wilkins" && bwProvider.connectionState == .idle {
                 bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
+            } else if connectedDev.providerID == "sony" && sonyProvider.connectionState == .idle {
+                sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
             }
             for _ in 0..<15 {
                 if activeProvider(manager: manager)?.connectionState == .ready { break }
@@ -50,10 +149,8 @@ struct LinuxApp {
             }
             if activeProvider(manager: manager)?.connectionState == .ready {
                 let isSetter = (subcommand == "anc" && filteredArgs.count > 1) ||
-                               (subcommand == "eq" && filteredArgs.count > 1) ||
-                               (subcommand == "volume" && filteredArgs.count > 1 && filteredArgs[1] == "set")
+                               (subcommand == "eq" && filteredArgs.count > 1)
                 if !isSetter {
-                    // Wait briefly for initial capability reads to populate live state
                     for _ in 0..<25 {
                         if bwProvider.hasConfirmedRead(BWRPCatalog.ancGet) &&
                            (bwProvider.supportsToneControls || bwProvider.hasConfirmedRead(BWRPCatalog.eqGet)) {
@@ -64,79 +161,77 @@ struct LinuxApp {
                     }
                 }
             }
-        } else {
-            // Brief delay for PipeWire audio sink discovery
-            try? await Task.sleep(nanoseconds: 50_000_000)
         }
 
         switch subcommand {
         case "status":
-            handleStatus(manager: manager, audio: audio, isJSON: isJSON)
-            exit(0)
+            let res = executeStatus(manager: manager, audio: audio, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "devices":
-            handleDevices(manager: manager, audio: audio, isJSON: isJSON)
-            exit(0)
+            let res = executeDevices(manager: manager, audio: audio, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "connect":
             let target = filteredArgs.count > 1 ? filteredArgs[1] : nil
-            await handleConnect(target: target, manager: manager, bwTransport: bwTransport, isJSON: isJSON)
-            exit(0)
+            let res = await executeConnect(target: target, manager: manager, bwTransport: bwTransport, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "disconnect":
-            handleDisconnect(manager: manager, isJSON: isJSON)
-            exit(0)
+            let res = executeDisconnect(manager: manager, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "anc":
             let modeArg = filteredArgs.count > 1 ? filteredArgs[1] : nil
-            await handleANC(modeArg: modeArg, manager: manager, isJSON: isJSON)
-            exit(0)
+            let res = await executeANC(modeArg: modeArg, manager: manager, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "ambient-level":
             let levelArg = filteredArgs.count > 1 ? Int(filteredArgs[1]) : nil
-            handleAmbientLevel(level: levelArg, sonyProvider: sonyProvider, isJSON: isJSON)
-            exit(0)
+            let res = executeAmbientLevel(level: levelArg, sonyProvider: sonyProvider, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "eq":
             let subArgs = Array(filteredArgs.dropFirst())
-            await handleEQ(args: subArgs, bwProvider: bwProvider, isJSON: isJSON)
-            exit(0)
-
-        case "volume":
-            let action = filteredArgs.count > 1 ? filteredArgs[1] : "get"
-            let value = filteredArgs.count > 2 ? Float(filteredArgs[2]) : nil
-            handleVolume(action: action, value: value, audio: audio, isJSON: isJSON)
-            exit(0)
+            let res = await executeEQ(args: subArgs, bwProvider: bwProvider, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "battery":
-            handleBattery(manager: manager, isJSON: isJSON)
-            exit(0)
+            let res = executeBattery(manager: manager, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "restore":
             let action = filteredArgs.count > 1 ? filteredArgs[1] : "status"
-            handleRestore(action: action, manager: manager, isJSON: isJSON)
-            exit(0)
-
-        case "monitor", "daemon":
-            audio.startMonitoring()
-            await handleDaemon(manager: manager, audio: audio, bwTransport: bwTransport)
+            let res = executeRestore(action: action, manager: manager, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "diag":
-            handleDiag(manager: manager, audio: audio, isJSON: isJSON)
-            exit(0)
+            let res = executeDiag(manager: manager, audio: audio, isJSON: isJSON)
+            return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
+
+        case "ping":
+            return LinuxIPCResponse(exitCode: 0, output: isJSON ? "{\"pong\":true}\n" : "pong\n")
+
+        case "daemon":
+            if filteredArgs.contains("stop") {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    runningServer?.stop()
+                    manager.shutdown()
+                    exit(0)
+                }
+                return LinuxIPCResponse(exitCode: 0, output: isJSON ? "{\"stopped\":true}\n" : "HeadBridge daemon stopped.\n")
+            } else {
+                return LinuxIPCResponse(exitCode: 0, output: isJSON ? "{\"running\":true}\n" : "HeadBridge daemon is running.\n")
+            }
 
         default:
-            print("Unknown command: \(subcommand). Use 'headbridge help' for available commands.")
-            exit(1)
+            let msg = "Unknown command: \(subcommand). Use 'headbridge help' for available commands.\n"
+            return LinuxIPCResponse(exitCode: 1, output: msg)
         }
     }
 
-    private static func activeProvider(manager: HeadphoneManager) -> (any HeadphoneProvider)? {
-        manager.providers.first { $0.connectionState == .ready }
-            ?? manager.providers.first { $0.connectionState == .connecting }
-    }
-
-    private static func handleStatus(manager: HeadphoneManager, audio: LinuxPipeWireAudio, isJSON: Bool) {
+    private static func executeStatus(manager: HeadphoneManager, audio: LinuxPipeWireAudio, isJSON: Bool) -> (output: String, exitCode: Int32) {
         let provider = activeProvider(manager: manager)
         let isConnected = provider?.connectionState == .ready
         let osConnectedDevice = manager.recognizedDevices.first(where: { $0.isConnected })
@@ -156,7 +251,6 @@ struct LinuxApp {
                 "batteryPercent": battery as Any,
                 "isCharging": provider?.isCharging as Any,
                 "noiseMode": provider?.noiseMode?.rawValue as Any,
-                "volume": audio.volume,
                 "audioSink": audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "",
                 "vendorRPCReady": isConnected
             ]
@@ -166,62 +260,61 @@ struct LinuxApp {
             } else if let sony = provider as? SonyMDRProvider {
                 dict["ambientLevel"] = sony.ambientLevel
             }
-            printJSON(dict)
-            return
+            return (jsonString(for: dict), 0)
         }
 
-        print("=== HeadBridge Status ===")
+        var lines: [String] = []
+        lines.append("=== HeadBridge Status ===")
         if let provider = provider, isConnected {
-            print("Device:        \(provider.connectedName)")
-            print("Vendor:        \(provider.vendorName)")
-            print("State:         \(provider.connectionState.title)")
+            lines.append("Device:        \(provider.connectedName)")
+            lines.append("Vendor:        \(provider.vendorName)")
+            lines.append("State:         \(provider.connectionState.title)")
             let battery = provider.batteryPercent ?? osConnectedDevice.flatMap { LinuxBluetoothInventory.shared.fetchBatteryPercentage(for: $0.address) }
             if let battery = battery {
                 let charging = (provider.isCharging ?? false) ? " (Charging)" : ""
-                print("Battery:       \(battery)%\(charging)")
+                lines.append("Battery:       \(battery)%\(charging)")
             } else {
-                print("Battery:       Unknown")
+                lines.append("Battery:       Unknown")
             }
             if let noiseMode = provider.noiseMode {
-                print("ANC Mode:      \(noiseModeDescription(noiseMode))")
+                lines.append("ANC Mode:      \(noiseModeDescription(noiseMode))")
             }
             if let bw = provider as? BowersWilkinsProvider {
-                print("Tone / EQ:     Bass: \(bw.bassLevel), Treble: \(bw.trebleLevel)")
+                lines.append("Tone / EQ:     Bass: \(bw.bassLevel), Treble: \(bw.trebleLevel)")
             } else if let sony = provider as? SonyMDRProvider {
-                print("Ambient Level: \(sony.ambientLevel)/20")
+                lines.append("Ambient Level: \(sony.ambientLevel)/20")
             }
             let sinkName = audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "Default"
-            let volPercent = Int((audio.volume * 100).rounded())
-            print("Audio Output:  \(sinkName) (Volume: \(volPercent)%)")
+            lines.append("Audio Output:  \(sinkName)")
         } else if let osDev = osConnectedDevice {
-            print("Device:        \(osDev.name) (\(osDev.address))")
-            print("Vendor:        \(osDev.vendorName)")
-            print("State:         Connected (Audio / BlueZ)")
+            lines.append("Device:        \(osDev.name) (\(osDev.address))")
+            lines.append("Vendor:        \(osDev.vendorName)")
+            lines.append("State:         Connected (Audio / BlueZ)")
             if let battery = LinuxBluetoothInventory.shared.fetchBatteryPercentage(for: osDev.address) {
-                print("Battery:       \(battery)%")
+                lines.append("Battery:       \(battery)%")
             } else {
-                print("Battery:       Unknown")
+                lines.append("Battery:       Unknown")
             }
             let sinkName = audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "Default"
-            let volPercent = Int((audio.volume * 100).rounded())
-            print("Audio Output:  \(sinkName) (Volume: \(volPercent)%)")
-            print("Vendor RPC:    Disconnected (BLE GATT required for ANC/EQ controls)")
+            lines.append("Audio Output:  \(sinkName)")
+            lines.append("Vendor RPC:    Disconnected (BLE GATT required for ANC/EQ controls)")
         } else {
-            print("No supported headphones currently connected.")
+            lines.append("No supported headphones currently connected.")
             let paired = manager.recognizedDevices
             if !paired.isEmpty {
-                print("\nRecognized paired devices:")
+                lines.append("\nRecognized paired devices:")
                 for dev in paired {
-                    print("  • \(dev.name) (\(dev.address)) [\(dev.vendorName)]")
+                    lines.append("  • \(dev.name) (\(dev.address)) [\(dev.vendorName)]")
                 }
-                print("\nRun 'headbridge connect <address>' to connect.")
+                lines.append("\nRun 'headbridge connect <address>' to connect.")
             } else {
-                print("No recognized Bowers & Wilkins or Sony devices found in paired Bluetooth inventory.")
+                lines.append("No recognized Bowers & Wilkins or Sony devices found in paired Bluetooth inventory.")
             }
         }
+        return (lines.joined(separator: "\n") + "\n", 0)
     }
 
-    private static func handleDevices(manager: HeadphoneManager, audio: LinuxPipeWireAudio, isJSON: Bool) {
+    private static func executeDevices(manager: HeadphoneManager, audio: LinuxPipeWireAudio, isJSON: Bool) -> (output: String, exitCode: Int32) {
         let paired = manager.recognizedDevices
 
         if isJSON {
@@ -235,31 +328,31 @@ struct LinuxApp {
                     "isConnected": dev.isConnected
                 ]
             }
-            printJSON(["devices": list])
-            return
+            return (jsonString(for: ["devices": list]), 0)
         }
 
-        print("=== Recognized Bluetooth Devices ===")
+        var lines: [String] = []
+        lines.append("=== Recognized Bluetooth Devices ===")
         if paired.isEmpty {
-            print("No supported Bowers & Wilkins or Sony headphones detected.")
-            print("Ensure headphones are paired via bluetoothctl or your desktop settings.")
+            lines.append("No supported Bowers & Wilkins or Sony headphones detected.")
+            lines.append("Ensure headphones are paired via bluetoothctl or your desktop settings.")
         } else {
             for dev in paired {
                 let status = dev.isConnected ? " [Connected]" : " [Paired]"
-                print("  \(dev.address)  \(dev.name)  (\(dev.vendorName))\(status)")
+                lines.append("  \(dev.address)  \(dev.name)  (\(dev.vendorName))\(status)")
             }
         }
+        return (lines.joined(separator: "\n") + "\n", 0)
     }
 
-    private static func handleConnect(target: String?, manager: HeadphoneManager, bwTransport: LinuxBowersWilkinsTransport, isJSON: Bool) async {
+    private static func executeConnect(target: String?, manager: HeadphoneManager, bwTransport: LinuxBowersWilkinsTransport, isJSON: Bool) async -> (output: String, exitCode: Int32) {
         let paired = manager.recognizedDevices
         guard !paired.isEmpty else {
             if isJSON {
-                printJSON(["error": "No recognized paired devices found"])
+                return (jsonString(for: ["error": "No recognized paired devices found"]), 1)
             } else {
-                print("Error: No recognized paired devices found.")
+                return ("Error: No recognized paired devices found.\n", 1)
             }
-            return
         }
 
         let device: RecognizedHeadphoneDevice
@@ -269,26 +362,20 @@ struct LinuxApp {
                 $0.name.lowercased().contains(target.lowercased())
             }) else {
                 if isJSON {
-                    printJSON(["error": "Device '\(target)' not found in paired list"])
+                    return (jsonString(for: ["error": "Device '\(target)' not found in paired list"]), 1)
                 } else {
-                    print("Error: Device '\(target)' not found in paired inventory.")
+                    return ("Error: Device '\(target)' not found in paired inventory.\n", 1)
                 }
-                return
             }
             device = matched
         } else {
             device = paired.first!
         }
 
-        if !isJSON {
-            print("Connecting to \(device.name) (\(device.address))...")
-        }
-
         if device.providerID == "bowers-wilkins" {
             bwTransport.connect(address: device.address, name: device.name)
         }
 
-        // Wait for connection to settle
         for _ in 0..<8 {
             try? await Task.sleep(nanoseconds: 250_000_000)
             if activeProvider(manager: manager)?.connectionState == .ready {
@@ -298,52 +385,51 @@ struct LinuxApp {
 
         let ready = activeProvider(manager: manager)?.connectionState == .ready
         if isJSON {
-            printJSON(["success": ready, "device": device.name, "address": device.address, "vendorRPCReady": ready])
+            return (jsonString(for: ["success": ready, "device": device.name, "address": device.address, "vendorRPCReady": ready]), ready ? 0 : 1)
         } else {
             if ready {
-                print("Successfully connected to \(device.name) vendor RPC!")
+                return ("Successfully connected to \(device.name) vendor RPC!\n", 0)
             } else {
-                print("Audio and Battery are connected via BlueZ.")
-                print("Vendor GATT RPC control session is not currently active.")
-                print("Bowers & Wilkins headphones broadcast their ANC/EQ GATT controls over their companion BLE interface ('LE_BWHP').")
+                var out = "Connecting to \(device.name) (\(device.address))...\n"
+                out += "Audio and Battery are connected via BlueZ.\n"
+                out += "Vendor GATT RPC control session is not currently active.\n"
+                out += "Bowers & Wilkins headphones broadcast their ANC/EQ GATT controls over their companion BLE interface ('LE_BWHP').\n"
+                return (out, 1)
             }
         }
     }
 
-    private static func handleDisconnect(manager: HeadphoneManager, isJSON: Bool) {
+    private static func executeDisconnect(manager: HeadphoneManager, isJSON: Bool) -> (output: String, exitCode: Int32) {
         guard let provider = activeProvider(manager: manager) else {
-            if isJSON { printJSON(["error": "No active device to disconnect"]) }
-            else { print("No active headphone connection.") }
-            return
+            if isJSON { return (jsonString(for: ["error": "No active device to disconnect"]), 1) }
+            else { return ("No active headphone connection.\n", 1) }
         }
 
         let name = provider.connectedName
         provider.disconnect()
 
         if isJSON {
-            printJSON(["disconnected": true, "device": name])
+            return (jsonString(for: ["disconnected": true, "device": name]), 0)
         } else {
-            print("Disconnected from \(name).")
+            return ("Disconnected from \(name).\n", 0)
         }
     }
 
-    private static func handleANC(modeArg: String?, manager: HeadphoneManager, isJSON: Bool) async {
+    private static func executeANC(modeArg: String?, manager: HeadphoneManager, isJSON: Bool) async -> (output: String, exitCode: Int32) {
         guard let provider = activeProvider(manager: manager) else {
-            if isJSON { printJSON(["error": "No headphone connected"]) }
-            else { print("Error: No headphone connected.") }
-            return
+            if isJSON { return (jsonString(for: ["error": "No headphone connected"]), 1) }
+            else { return ("Error: No headphone connected.\n", 1) }
         }
 
         guard let modeArg = modeArg else {
-            // Print current mode
             let current = provider.noiseMode
             if isJSON {
-                printJSON(["ancMode": current?.rawValue as Any, "description": current.map(noiseModeDescription) as Any])
+                return (jsonString(for: ["ancMode": current?.rawValue as Any, "description": current.map(noiseModeDescription) as Any]), 0)
             } else {
-                print("Current ANC mode: \(current.map(noiseModeDescription) ?? "Unknown")")
-                print("Supported modes: \(provider.supportedNoiseModes.map(noiseModeDescription).joined(separator: ", "))")
+                var out = "Current ANC mode: \(current.map(noiseModeDescription) ?? "Unknown")\n"
+                out += "Supported modes: \(provider.supportedNoiseModes.map(noiseModeDescription).joined(separator: ", "))\n"
+                return (out, 0)
             }
-            return
         }
 
         let targetMode: HeadphoneNoiseMode?
@@ -361,55 +447,53 @@ struct LinuxApp {
         }
 
         guard let mode = targetMode else {
-            print("Invalid ANC mode: \(modeArg). Available: off, anc, ambient, wind")
-            return
+            return ("Invalid ANC mode: \(modeArg). Available: off, anc, ambient, wind\n", 1)
         }
 
         provider.setNoiseMode(mode)
-        for _ in 0..<20 {
+        for _ in 0..<25 {
             if let bw = provider as? BowersWilkinsProvider, !bw.isCommandInFlightOrQueued(BWRPCatalog.ancSet) { break }
-            try? await Task.sleep(nanoseconds: 30_000_000)
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
 
         if isJSON {
-            printJSON(["success": true, "ancMode": mode.rawValue, "description": noiseModeDescription(mode)])
+            return (jsonString(for: ["success": true, "ancMode": mode.rawValue, "description": noiseModeDescription(mode)]), 0)
         } else {
-            print("ANC mode set to: \(noiseModeDescription(mode))")
+            return ("ANC mode set to: \(noiseModeDescription(mode))\n", 0)
         }
     }
 
-    private static func handleAmbientLevel(level: Int?, sonyProvider: SonyMDRProvider, isJSON: Bool) {
+    private static func executeAmbientLevel(level: Int?, sonyProvider: SonyMDRProvider, isJSON: Bool) -> (output: String, exitCode: Int32) {
         guard let level = level else {
             let current = sonyProvider.ambientLevel
             if isJSON {
-                printJSON(["ambientLevel": current])
+                return (jsonString(for: ["ambientLevel": current]), 0)
             } else {
-                print("Current ambient level: \(current)/20")
+                return ("Current ambient level: \(current)/20\n", 0)
             }
-            return
         }
 
         let clamped = max(0, min(20, level))
         sonyProvider.setAmbientLevel(clamped)
         if isJSON {
-            printJSON(["success": true, "ambientLevel": clamped])
+            return (jsonString(for: ["success": true, "ambientLevel": clamped]), 0)
         } else {
-            print("Ambient sound level set to: \(clamped)/20")
+            return ("Ambient sound level set to: \(clamped)/20\n", 0)
         }
     }
 
-    private static func handleEQ(args: [String], bwProvider: BowersWilkinsProvider, isJSON: Bool) async {
+    private static func executeEQ(args: [String], bwProvider: BowersWilkinsProvider, isJSON: Bool) async -> (output: String, exitCode: Int32) {
         if args.isEmpty {
             let bass = bwProvider.bassLevel
             let treble = bwProvider.trebleLevel
             if isJSON {
-                printJSON(["bass": bass, "treble": treble])
+                return (jsonString(for: ["bass": bass, "treble": treble]), 0)
             } else {
-                print("Equalizer / Tone Controls:")
-                print("  Bass:   \(bass) (-60 to +60)")
-                print("  Treble: \(treble) (-60 to +60)")
+                var out = "Equalizer / Tone Controls:\n"
+                out += "  Bass:   \(bass) (-60 to +60)\n"
+                out += "  Treble: \(treble) (-60 to +60)\n"
+                return (out, 0)
             }
-            return
         }
 
         var i = 0
@@ -428,49 +512,28 @@ struct LinuxApp {
             }
         }
 
-        for _ in 0..<20 {
+        for _ in 0..<25 {
             if !bwProvider.isCommandInFlightOrQueued(BWRPCatalog.bassSet) &&
                !bwProvider.isCommandInFlightOrQueued(BWRPCatalog.trebleSet) {
                 break
             }
-            try? await Task.sleep(nanoseconds: 30_000_000)
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
 
         if isJSON {
-            printJSON(["success": true, "bass": bwProvider.bassLevel, "treble": bwProvider.trebleLevel])
+            return (jsonString(for: ["success": true, "bass": bwProvider.bassLevel, "treble": bwProvider.trebleLevel]), 0)
         } else {
-            print("Updated tone controls: Bass=\(bwProvider.bassLevel), Treble=\(bwProvider.trebleLevel)")
+            return ("Updated tone controls: Bass=\(bwProvider.bassLevel), Treble=\(bwProvider.trebleLevel)\n", 0)
         }
     }
 
-    private static func handleVolume(action: String, value: Float?, audio: LinuxPipeWireAudio, isJSON: Bool) {
-        if action == "set", let val = value {
-            let normalized = val > 1.0 ? val / 100.0 : val
-            audio.setVolume(normalized)
-            let percent = Int((audio.volume * 100).rounded())
-            if isJSON {
-                printJSON(["volume": audio.volume, "percent": percent])
-            } else {
-                print("Volume set to: \(percent)%")
-            }
-        } else {
-            let percent = Int((audio.volume * 100).rounded())
-            if isJSON {
-                printJSON(["volume": audio.volume, "percent": percent])
-            } else {
-                print("Current Volume: \(percent)% (\(String(format: "%.2f", audio.volume)))")
-            }
-        }
-    }
-
-    private static func handleBattery(manager: HeadphoneManager, isJSON: Bool) {
+    private static func executeBattery(manager: HeadphoneManager, isJSON: Bool) -> (output: String, exitCode: Int32) {
         let provider = activeProvider(manager: manager)
         let osConnectedDevice = manager.recognizedDevices.first(where: { $0.isConnected })
 
         guard provider != nil || osConnectedDevice != nil else {
-            if isJSON { printJSON(["error": "No headphone connected"]) }
-            else { print("No headphone connected.") }
-            return
+            if isJSON { return (jsonString(for: ["error": "No headphone connected"]), 1) }
+            else { return ("No headphone connected.\n", 1) }
         }
 
         let name = (provider?.connectedName.isEmpty == false ? provider?.connectedName : osConnectedDevice?.name) ?? "Headphones"
@@ -478,15 +541,16 @@ struct LinuxApp {
         let isCharging = provider?.isCharging ?? false
 
         if isJSON {
-            printJSON(["device": name, "batteryPercent": percent as Any, "isCharging": isCharging])
+            return (jsonString(for: ["device": name, "batteryPercent": percent as Any, "isCharging": isCharging]), 0)
         } else {
-            print("Device:        \(name)")
-            print("Battery:       \(percent.map { "\($0)%" } ?? "Unknown")")
-            print("Charging:      \(isCharging ? "Yes" : "No")")
+            var out = "Device:        \(name)\n"
+            out += "Battery:       \(percent.map { "\($0)%" } ?? "Unknown")\n"
+            out += "Charging:      \(isCharging ? "Yes" : "No")\n"
+            return (out, 0)
         }
     }
 
-    private static func handleRestore(action: String, manager: HeadphoneManager, isJSON: Bool) {
+    private static func executeRestore(action: String, manager: HeadphoneManager, isJSON: Bool) -> (output: String, exitCode: Int32) {
         let store = LinuxSettingsStore.shared
         let provider = activeProvider(manager: manager)
         let providerID = provider?.providerID ?? "bowers-wilkins"
@@ -494,49 +558,22 @@ struct LinuxApp {
         switch action.lowercased() {
         case "enable", "on", "1":
             store.setRestoreOnConnectEnabled(true, for: providerID)
-            if isJSON { printJSON(["restoreOnConnect": true, "provider": providerID]) }
-            else { print("Restore-on-connect enabled for \(providerID).") }
+            if isJSON { return (jsonString(for: ["restoreOnConnect": true, "provider": providerID]), 0) }
+            else { return ("Restore-on-connect enabled for \(providerID).\n", 0) }
 
         case "disable", "off", "0":
             store.setRestoreOnConnectEnabled(false, for: providerID)
-            if isJSON { printJSON(["restoreOnConnect": false, "provider": providerID]) }
-            else { print("Restore-on-connect disabled for \(providerID).") }
+            if isJSON { return (jsonString(for: ["restoreOnConnect": false, "provider": providerID]), 0) }
+            else { return ("Restore-on-connect disabled for \(providerID).\n", 0) }
 
         default:
             let enabled = store.isRestoreOnConnectEnabled(for: providerID)
-            if isJSON { printJSON(["restoreOnConnect": enabled, "provider": providerID]) }
-            else { print("Restore-on-connect for \(providerID): \(enabled ? "Enabled" : "Disabled")") }
+            if isJSON { return (jsonString(for: ["restoreOnConnect": enabled, "provider": providerID]), 0) }
+            else { return ("Restore-on-connect for \(providerID): \(enabled ? "Enabled" : "Disabled")\n", 0) }
         }
     }
 
-    private static func handleDaemon(manager: HeadphoneManager, audio: LinuxPipeWireAudio, bwTransport: LinuxBowersWilkinsTransport) async {
-        print("Starting HeadBridge daemon on Linux...")
-        print("Monitoring Bluetooth connections and PipeWire audio stream...")
-        print("Press Ctrl+C to exit.")
-
-        // Listen for signals
-        let sigSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        sigSource.setEventHandler {
-            print("\nShutting down HeadBridge daemon cleanly...")
-            manager.shutdown()
-            exit(0)
-        }
-        sigSource.resume()
-
-        let sigTermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        sigTermSource.setEventHandler {
-            print("\nTerminating HeadBridge daemon...")
-            manager.shutdown()
-            exit(0)
-        }
-        sigTermSource.resume()
-
-        while true {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-        }
-    }
-
-    private static func handleDiag(manager: HeadphoneManager, audio: LinuxPipeWireAudio, isJSON: Bool) {
+    private static func executeDiag(manager: HeadphoneManager, audio: LinuxPipeWireAudio, isJSON: Bool) -> (output: String, exitCode: Int32) {
         var info: [String: Any] = [:]
         info["os"] = "Linux"
         info["configDir"] = AppPlatformPaths.configDirectory.path
@@ -557,27 +594,142 @@ struct LinuxApp {
         }
 
         if isJSON {
-            printJSON(info)
+            return (jsonString(for: info), 0)
         } else {
-            print("=== HeadBridge Linux Diagnostics ===")
-            print("Configuration Directory: \(AppPlatformPaths.configDirectory.path)")
-            print("Data Directory:          \(AppPlatformPaths.dataDirectory.path)")
-            print("\nAudio Sinks Detected:")
+            var lines: [String] = []
+            lines.append("=== HeadBridge Linux Diagnostics ===")
+            lines.append("Configuration Directory: \(AppPlatformPaths.configDirectory.path)")
+            lines.append("Data Directory:          \(AppPlatformPaths.dataDirectory.path)")
+            lines.append("\nAudio Sinks Detected:")
             for dev in audio.devices {
                 let def = dev.id == audio.defaultDeviceID ? " [Default]" : ""
-                print("  • [\(dev.id)] \(dev.name)\(def)")
+                lines.append("  • [\(dev.id)] \(dev.name)\(def)")
             }
-            print("\nBluetooth Devices Paired:")
+            lines.append("\nBluetooth Devices Paired:")
             for dev in manager.recognizedDevices {
-                print("  • \(dev.address) - \(dev.name) (\(dev.vendorName))")
+                lines.append("  • \(dev.address) - \(dev.name) (\(dev.vendorName))")
             }
             if let provider = activeProvider(manager: manager) {
-                print("\nActive Headphone Session:")
-                print("  • Name:    \(provider.connectedName)")
-                print("  • State:   \(provider.connectionState.title)")
-                print("  • Vendor:  \(provider.vendorName)")
-                print("  • Battery: \(provider.batteryPercent.map { "\($0)%" } ?? "—")")
+                lines.append("\nActive Headphone Session:")
+                lines.append("  • Name:    \(provider.connectedName)")
+                lines.append("  • State:   \(provider.connectionState.title)")
+                lines.append("  • Vendor:  \(provider.vendorName)")
+                lines.append("  • Battery: \(provider.batteryPercent.map { "\($0)%" } ?? "—")")
             }
+            return (lines.joined(separator: "\n") + "\n", 0)
+        }
+    }
+
+    private static func handleDaemon(
+        manager: HeadphoneManager,
+        audio: LinuxPipeWireAudio,
+        bwTransport: LinuxBowersWilkinsTransport,
+        bwProvider: BowersWilkinsProvider,
+        sonyProvider: SonyMDRProvider
+    ) async {
+        print("Starting HeadBridge daemon on Linux...")
+        let server = LinuxDaemonServer()
+        self.runningServer = server
+
+        server.requestHandler = { request in
+            let filteredArgs = request.args.filter { $0 != "--json" && $0 != "--verbose" && $0 != "-v" }
+            let subcommand = filteredArgs.first ?? "status"
+
+            if subcommand == "ping" {
+                return LinuxIPCResponse(exitCode: 0, output: request.isJSON ? "{\"pong\":true}\n" : "pong\n")
+            }
+
+            if subcommand == "daemon" {
+                if filteredArgs.contains("stop") {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        runningServer?.stop()
+                        manager.shutdown()
+                        exit(0)
+                    }
+                    return LinuxIPCResponse(exitCode: 0, output: request.isJSON ? "{\"stopped\":true}\n" : "HeadBridge daemon stopped.\n")
+                } else {
+                    return LinuxIPCResponse(exitCode: 0, output: request.isJSON ? "{\"running\":true}\n" : "HeadBridge daemon is running.\n")
+                }
+            }
+
+            return await dispatchCommand(
+                args: request.args,
+                isJSON: request.isJSON,
+                manager: manager,
+                audio: audio,
+                bwTransport: bwTransport,
+                bwProvider: bwProvider,
+                sonyProvider: sonyProvider
+            )
+        }
+
+        guard server.start() else {
+            fputs("Error: Failed to bind daemon socket at \(server.socketPath). Is another daemon instance running?\n", stderr)
+            exit(1)
+        }
+
+        // Auto-connect to recognized connected headphone asynchronously
+        Task {
+            if let connectedDev = manager.recognizedDevices.first(where: { $0.isConnected }) {
+                if connectedDev.providerID == "bowers-wilkins" {
+                    bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
+                } else if connectedDev.providerID == "sony" {
+                    sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
+                }
+                for _ in 0..<30 {
+                    if activeProvider(manager: manager)?.connectionState == .ready { break }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                if activeProvider(manager: manager)?.connectionState == .ready {
+                    for _ in 0..<30 {
+                        if bwProvider.hasConfirmedRead(BWRPCatalog.ancGet) &&
+                           (bwProvider.supportsToneControls || bwProvider.hasConfirmedRead(BWRPCatalog.eqGet)) {
+                            break
+                        }
+                        if !bwProvider.hasPendingWrites { break }
+                        try? await Task.sleep(nanoseconds: 30_000_000)
+                    }
+                }
+            }
+        }
+
+        // Auto-connect when headphones connect while daemon is running
+        self.autoConnectCancellable = audio.devicesPublisher
+            .sink { _ in
+                guard let connectedDev = manager.recognizedDevices.first(where: { $0.isConnected }) else { return }
+                if connectedDev.providerID == "bowers-wilkins" && bwProvider.connectionState == .idle {
+                    bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
+                } else if connectedDev.providerID == "sony" && sonyProvider.connectionState == .idle {
+                    sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
+                }
+            }
+
+        print("HeadBridge daemon listening on \(server.socketPath)")
+        print("Monitoring Bluetooth connections and PipeWire audio stream...")
+        print("Use 'headbridge daemon status' to check health, or 'headbridge daemon stop' to terminate.")
+
+        let sigSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sigSource.setEventHandler {
+            print("\nShutting down HeadBridge daemon cleanly...")
+            server.stop()
+            manager.shutdown()
+            exit(0)
+        }
+        sigSource.resume()
+
+        let sigTermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        sigTermSource.setEventHandler {
+            print("\nTerminating HeadBridge daemon...")
+            server.stop()
+            manager.shutdown()
+            exit(0)
+        }
+        sigTermSource.resume()
+
+        // Yield to cooperative Tasks and DispatchQueue.main
+        while true {
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
     }
 
@@ -590,13 +742,12 @@ struct LinuxApp {
         }
     }
 
-    private static func printJSON(_ dictionary: [String: Any]) {
+    private static func jsonString(for dictionary: [String: Any]) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: dictionary, options: [.prettyPrinted, .sortedKeys]),
               let str = String(data: data, encoding: .utf8) else {
-            print("{}")
-            return
+            return "{}\n"
         }
-        print(str)
+        return str + "\n"
     }
 
     private static func printHelp() {
@@ -614,15 +765,15 @@ struct LinuxApp {
             anc [off|anc|ambient]       Get or set Active Noise Cancellation mode
             ambient-level [0-20]        Get or set Sony ambient sound level
             eq [bass <n>] [treble <n>]  Get or set tone / EQ controls (-60 to +60)
-            volume [get|set <0-100>]    Get or set audio output volume
             battery                     Show battery percentage and charging status
             restore [status|on|off]     Configure restore-on-connect profile
-            monitor, daemon             Run persistent daemon monitoring connections
+            daemon [start|status|stop]  Run or control the background daemon
             diag                        Print system and diagnostic state
             help                        Show this help message
 
         OPTIONS:
             --json                      Format output as JSON
+            --verbose, -v               Print verbose transport logs
         """)
     }
 }

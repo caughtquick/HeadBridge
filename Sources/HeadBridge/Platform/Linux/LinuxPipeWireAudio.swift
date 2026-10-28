@@ -24,6 +24,7 @@ public final class LinuxPipeWireAudio: ObservableObject, AudioControllerProtocol
 
     private let runner: LinuxCommandRunner
     private var monitorProcess: Process?
+    private var debounceWorkItem: DispatchWorkItem?
 
     public init(runner: LinuxCommandRunner = .shared, startMonitoring: Bool = false) {
         self.runner = runner
@@ -212,9 +213,18 @@ public final class LinuxPipeWireAudio: ObservableObject, AudioControllerProtocol
 
     private func startEventMonitor() {
         monitorProcess?.terminate()
-        monitorProcess = runner.spawn("pactl", arguments: ["subscribe"]) { [weak self] _ in
+        monitorProcess = runner.spawn("pactl", arguments: ["subscribe"]) { [weak self] line in
+            let isRelevant = line.contains("on sink") || line.contains("on source") || line.contains("on card") || line.contains("on server")
+            guard isRelevant else { return }
+
             DispatchQueue.main.async { [weak self] in
-                self?.refresh()
+                guard let self = self else { return }
+                self.debounceWorkItem?.cancel()
+                let item = DispatchWorkItem { [weak self] in
+                    self?.refresh()
+                }
+                self.debounceWorkItem = item
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
             }
         }
     }
