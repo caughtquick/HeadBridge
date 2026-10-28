@@ -942,7 +942,8 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
 
     nonisolated static func isPx8OrPx7S2FamilyName(_ name: String) -> Bool {
         let normalized = BluetoothDeviceNameMatcher.normalized(name)
-        if ["px8", "bowerswilkinspx8"].contains(normalized) {
+        if ["px8", "bowerswilkinspx8"].contains(normalized) ||
+           (normalized.contains("px8") && !normalized.contains("px8s2")) {
             return true
         }
         if normalized.contains("px7s2") || normalized.contains("px7s2e") {

@@ -351,7 +351,17 @@ final class RPCCodecTests: XCTestCase {
             .originalPx8
         )
         XCTAssertEqual(
-            BowersWilkinsProvider.ancWireProfile(advertisedName: "LE_BWHP", audioDeviceNames: ["Abhijit’s Px7 S2e"]),
+            BowersWilkinsProvider.ancWireProfile(advertisedName: "LE_BWHP", audioDeviceNames: ["Px7 S2e"]),
+            .originalPx8
+        )
+        XCTAssertEqual(
+            BowersWilkinsProvider.ancWireProfile(
+                advertisedName: "LE_BWHP", audioDeviceNames: ["Bowers & Wilkins Px7 S2e"]),
+            .originalPx8
+        )
+        XCTAssertEqual(
+            BowersWilkinsProvider.ancWireProfile(
+                advertisedName: "LE_BWHP", audioDeviceNames: ["Abhijit’s Px7 S2e"]),
             .originalPx8
         )
         // Other generically advertised models use values not confirmed here.
