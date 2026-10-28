@@ -1,3 +1,4 @@
+#if os(macOS)
 import Combine
 import Foundation
 import Sparkle
@@ -46,3 +47,5 @@ final class UpdateController: ObservableObject {
         automaticallyDownloadsUpdates = standardController.updater.automaticallyDownloadsUpdates
     }
 }
+#endif
+

@@ -1,4 +1,6 @@
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
 import XCTest
 @testable import HeadBridge
@@ -20,7 +22,7 @@ final class RPCCodecTests: XCTestCase {
     }
 
     @MainActor
-    func testManagerShutdownReleasesEachProviderOnlyOnce() {
+    func testManagerShutdownReleasesEachProviderOnlyOnce() async {
         let provider = TestHeadphoneProvider()
         let manager = HeadphoneManager(providers: [provider])
 
@@ -57,7 +59,7 @@ final class RPCCodecTests: XCTestCase {
     }
 
     @MainActor
-    func testSidebarSnapshotMatchesAPrefixedMACDeviceIdentifier() {
+    func testSidebarSnapshotMatchesAPrefixedMACDeviceIdentifier() async {
         // Bowers & Wilkins reports "mac:<address>" and "Px8" is too short for
         // the name fallback, so only the identifier can mark the row ready.
         let provider = TestHeadphoneProvider(connectedDeviceID: "mac:ec:66:d1:c6:1c:58")
@@ -129,7 +131,6 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertEqual(devices.first(where: { $0.id == "11:22:33:44:55:66" })?.isConnected, false)
     }
 
-    @MainActor
     func testSonyAutomaticConnectionUsesBluetoothAudioWithoutWaitingForCoreAudio() {
         let sony = BluetoothPairedDevice(
             id: "11:22:33:44:55:66",
@@ -155,7 +156,7 @@ final class RPCCodecTests: XCTestCase {
     }
 
     @MainActor
-    func testManagerListsOnlyPairedDevicesRecognizedByAProvider() {
+    func testManagerListsOnlyPairedDevicesRecognizedByAProvider() async {
         let provider = TestHeadphoneProvider()
         let manager = HeadphoneManager(providers: [provider])
 
@@ -223,7 +224,6 @@ final class RPCCodecTests: XCTestCase {
         )
     }
 
-    @MainActor
     func testToneLevelsAreClampedToTheDeviceRange() {
         XCTAssertEqual(BowersWilkinsProvider.clampedTone(61), 60)
         XCTAssertEqual(BowersWilkinsProvider.clampedTone(-200), -60)
@@ -287,7 +287,6 @@ final class RPCCodecTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testAudioAndBLEDeviceNameMatching() {
         XCTAssertTrue(BowersWilkinsProvider.deviceNamesMatch("Px7 S3", "PX7-S3"))
         XCTAssertTrue(BowersWilkinsProvider.deviceNamesMatch("Bowers & Wilkins Px7 S3", "Px7 S3"))
@@ -333,7 +332,6 @@ final class RPCCodecTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testANCWireProfileSelectionRequiresAVerifiedModel() {
         XCTAssertEqual(
             BowersWilkinsProvider.ancWireProfile(advertisedName: "Px7 S3", audioDeviceNames: ["Px7 S3"]),
@@ -348,8 +346,26 @@ final class RPCCodecTests: XCTestCase {
                 advertisedName: "LE_BWHP", audioDeviceNames: ["Bowers & Wilkins Px8"]),
             .originalPx8
         )
+        XCTAssertEqual(
+            BowersWilkinsProvider.ancWireProfile(advertisedName: "LE_BWHP", audioDeviceNames: ["Px7 S2"]),
+            .originalPx8
+        )
+        XCTAssertEqual(
+            BowersWilkinsProvider.ancWireProfile(advertisedName: "LE_BWHP", audioDeviceNames: ["Px7 S2e"]),
+            .originalPx8
+        )
+        XCTAssertEqual(
+            BowersWilkinsProvider.ancWireProfile(
+                advertisedName: "LE_BWHP", audioDeviceNames: ["Bowers & Wilkins Px7 S2e"]),
+            .originalPx8
+        )
+        XCTAssertEqual(
+            BowersWilkinsProvider.ancWireProfile(
+                advertisedName: "LE_BWHP", audioDeviceNames: ["Abhijit’s Px7 S2e"]),
+            .originalPx8
+        )
         // Other generically advertised models use values not confirmed here.
-        for name in ["Px8 S2", "Px7 S2", "Px7 S2e", "PX7", "Pi7 S2"] {
+        for name in ["Px8 S2", "PX7", "Pi7 S2"] {
             XCTAssertEqual(
                 BowersWilkinsProvider.ancWireProfile(advertisedName: "LE_BWHP", audioDeviceNames: [name]),
                 .unverified,
@@ -366,7 +382,6 @@ final class RPCCodecTests: XCTestCase {
         )
     }
 
-    @MainActor
     func testGenericFallbackWaitsForAModelNamedAdvertisement() {
         let start = Date(timeIntervalSinceReferenceDate: 1_000)
         let grace = BowersWilkinsProvider.genericFallbackGrace
@@ -380,14 +395,12 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertTrue(BowersWilkinsProvider.allowsGenericFallback(scanStartedAt: nil, now: start))
     }
 
-    @MainActor
     func testRenameIsOfferedOnlyForModelNamedAdvertisers() {
         XCTAssertTrue(BowersWilkinsProvider.allowsRename(advertisedName: "Px7 S3"))
         XCTAssertFalse(BowersWilkinsProvider.allowsRename(advertisedName: "LE_BWHP"))
         XCTAssertFalse(BowersWilkinsProvider.allowsRename(advertisedName: nil))
     }
 
-    @MainActor
     func testToneRepliesRejectMalformedAndOutOfRangeValues() throws {
         XCTAssertEqual(BowersWilkinsProvider.toneLevel(from: .int(-60)), -60)
         XCTAssertEqual(BowersWilkinsProvider.toneLevel(from: .int(25)), 25)
@@ -413,7 +426,6 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertThrowsError(try BWRPC.decode(Data([0x0C, 0x92, 0x18, 0x04, 0x00, 0x00, 0x02, 0x00, 0xD0])))
     }
 
-    @MainActor
     func testToneControlsRequireBothReadsToSucceed() {
         var confirmed = BWConfirmedReads()
         XCTAssertFalse(BowersWilkinsProvider.supportsToneControls(confirmed))
@@ -426,7 +438,6 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertTrue(BowersWilkinsProvider.supportsToneControls(confirmed))
     }
 
-    @MainActor
     func testGenericPeripheralAddressVerdict() {
         // The original Px8 reports its address as text in this shape, while
         // the macOS inventory uses colon- or hyphen-separated octets.
@@ -608,7 +619,7 @@ final class RPCCodecTests: XCTestCase {
     }
 
     @MainActor
-    func testVolumeSynchronizationPreferencesAreProviderScopedAndMigrateSonyValue() {
+    func testVolumeSynchronizationPreferencesAreProviderScopedAndMigrateSonyValue() async {
         let suiteName = "HeadBridgeTests.Settings.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -629,7 +640,7 @@ final class RPCCodecTests: XCTestCase {
     }
 
     @MainActor
-    func testDockIconPreferenceDefaultsOffAndPersists() {
+    func testDockIconPreferenceDefaultsOffAndPersists() async {
         let suiteName = "HeadBridgeTests.Settings.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -641,7 +652,7 @@ final class RPCCodecTests: XCTestCase {
     }
 
     @MainActor
-    func testBatteryHistoryIsPersistentAndIsolatedPerDevice() {
+    func testBatteryHistoryIsPersistentAndIsolatedPerDevice() async {
         let storageURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("HeadBridgeBatteryHistory-\(UUID().uuidString).plist")
         defer { try? FileManager.default.removeItem(at: storageURL) }
@@ -742,7 +753,6 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertTrue(restored.histories.isEmpty)
     }
 
-    @MainActor
     func testBowersWilkinsPersistentHardwareIdentifier() {
         XCTAssertEqual(
             BowersWilkinsProvider.persistentDeviceIdentifier(
@@ -766,7 +776,7 @@ final class RPCCodecTests: XCTestCase {
     }
 
     @MainActor
-    func testRestoreProfilesAreIsolatedByProviderAndDevice() {
+    func testRestoreProfilesAreIsolatedByProviderAndDevice() async {
         struct Profile: Codable, Equatable { let mode: Int }
         let suiteName = "HeadBridgeTests.Restore.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -801,7 +811,6 @@ final class RPCCodecTests: XCTestCase {
             ))
     }
 
-    @MainActor
     func testSonyDiscoveryAndVolumeMapping() {
         XCTAssertTrue(SonyMDRProvider.isSupportedHeadphoneName("WH-1000XM3"))
         XCTAssertTrue(SonyMDRProvider.isSupportedHeadphoneName("WH-CH720N"))
@@ -975,6 +984,27 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertTrue(SonyV1OptimizerStatus.analyzing.isRunning)
         XCTAssertFalse(SonyV1OptimizerStatus.finished.isRunning)
     }
+
+#if os(Linux)
+    @MainActor
+    private static func dummyMainActorPing() async -> LinuxIPCResponse {
+        return LinuxIPCResponse(exitCode: 0, output: "pong\n")
+    }
+
+    func testLinuxDaemonIPCPing() async {
+        let sockPath = "/tmp/test-headbridge-\(UUID().uuidString).sock"
+        let server = LinuxDaemonServer(socketPath: sockPath)
+        server.requestHandler = { req in
+            return await Self.dummyMainActorPing()
+        }
+        XCTAssertTrue(server.start())
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let resp = LinuxDaemonClient.sendCommand(args: ["ping"], isJSON: false, socketPath: sockPath)
+        XCTAssertEqual(resp?.output, "pong\n")
+        server.stop()
+    }
+#endif
 }
 
 @MainActor

@@ -1,5 +1,9 @@
+#if canImport(Combine)
 import Combine
+#endif
+#if canImport(CoreBluetooth)
 import CoreBluetooth
+#endif
 import Foundation
 
 enum ANCMode: Int, CaseIterable, Identifiable {
@@ -22,8 +26,9 @@ enum ANCMode: Int, CaseIterable, Identifiable {
 enum ANCWireProfile: Equatable {
     /// Hardware-verified on Px7 S3: off 0, noise cancellation 1, pass-through 2.
     case standard
-    /// Hardware-verified on the original Px8 (RPC software `0(20.0.2.0)`):
-    /// off 1, noise cancellation 2, pass-through 3. The device rejects 0.
+    /// Hardware-verified on original Px8 (RPC software `0(20.0.2.0)`) and
+    /// Px7 S2 / Px7 S2e: off 1, noise cancellation 2, pass-through 3.
+    /// The devices reject 0 with device error 6.
     case originalPx8
     /// A generically advertised model whose values have not been confirmed on
     /// hardware. Noise control stays hidden and nothing is written.
@@ -66,7 +71,9 @@ struct DiscoveredPeripheral: Identifiable {
     let id: UUID
     let name: String
     let rssi: Int
+    #if canImport(CoreBluetooth)
     fileprivate let peripheral: CBPeripheral
+    #endif
 }
 
 struct ProbeReading: Identifiable {
@@ -77,33 +84,6 @@ struct ProbeReading: Identifiable {
     let updatedAt: Date
 }
 
-struct TransportLogEntry: Identifiable {
-    enum Direction: String { case outgoing = "TX", incoming = "RX", info = "INFO" }
-
-    let id = UUID()
-    let time: Date
-    let direction: Direction
-    let text: String
-
-    /// Time of day with milliseconds, for the log list.
-    static let timeFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        return formatter
-    }()
-
-    /// Plain-text export: one entry per line, oldest first, with a full
-    /// local timestamp.
-    static func exportText(_ entries: [TransportLogEntry], timeZone: TimeZone = .current) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        formatter.timeZone = timeZone
-        return entries
-            .map { "\(formatter.string(from: $0.time)) \($0.direction.rawValue) \($0.text)" }
-            .joined(separator: "\n") + "\n"
-    }
-}
 
 struct PairedDeviceInfo: Identifiable {
     let id: Int
@@ -189,14 +169,24 @@ struct BWRPCWriteQueue {
         self.capacity = capacity
     }
 
+    var isEmpty: Bool { items.isEmpty }
+
+    func contains(commandKey: String) -> Bool {
+        items.contains { $0.commandKey == commandKey }
+    }
+
     @discardableResult
-    mutating func enqueue(_ pending: BWRPCPendingWrite) -> EnqueueResult {
+    mutating func enqueue(_ pending: BWRPCPendingWrite, priority: Bool = false) -> EnqueueResult {
         if let existing = items.lastIndex(where: { $0.commandKey == pending.commandKey }) {
             items[existing] = pending
             return .replaced
         }
         guard items.count < capacity else { return .rejectedFull }
-        items.append(pending)
+        if priority {
+            items.insert(pending, at: 0)
+        } else {
+            items.append(pending)
+        }
         return .appended
     }
 
@@ -253,6 +243,7 @@ struct BWAutomaticConnectionTracker: Equatable {
     }
 }
 
+#if canImport(CoreBluetooth)
 private enum BWPeripheralEvent {
     case discoveredServices(Error?)
     case discoveredCharacteristics(CBService, Error?)
@@ -322,6 +313,7 @@ private final class BWPeripheralDelegateProxy: NSObject, CBPeripheralDelegate {
         }
     }
 }
+#endif
 
 @MainActor
 final class BowersWilkinsProvider: NSObject, ObservableObject {
@@ -399,15 +391,21 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     @Published private(set) var log: [TransportLogEntry] = []
     @Published private(set) var pairedDevices: [PairedDeviceInfo] = []
 
+    #if canImport(CoreBluetooth)
     private var central: CBCentralManager!
-    private var discovered: [UUID: DiscoveredPeripheral] = [:]
     private var peripheral: CBPeripheral?
     private var requestCharacteristic: CBCharacteristic?
     private var responseCharacteristic: CBCharacteristic?
     private var eventCharacteristic: CBCharacteristic?
+    private var peripheralDelegateProxy: BWPeripheralDelegateProxy?
+    private var teardownPeripheral: CBPeripheral?
+    #endif
+    private var transport: (any BowersWilkinsTransportProtocol)?
+    private var discovered: [UUID: DiscoveredPeripheral] = [:]
     private var transportReadiness = BWRPCTransportReadiness()
     private var writeQueue = BWRPCWriteQueue(capacity: BowersWilkinsProvider.maximumQueuedWrites)
     private var writeInFlight = false
+    private var activeWriteCommandKey: String? = nil
     private var writeTimeoutTask: Task<Void, Never>?
     private var refreshWorkItems: [String: DispatchWorkItem] = [:]
     private var didStartInitialRefresh = false
@@ -424,8 +422,6 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     private var connectionAttemptGeneration = 0
     private var transportGeneration = 0
     private var activeSessionIdentity: BWPeripheralSessionIdentity?
-    private var peripheralDelegateProxy: BWPeripheralDelegateProxy?
-    private var teardownPeripheral: CBPeripheral?
     private var teardownTimeoutWorkItem: DispatchWorkItem?
     private var teardownGeneration = 0
     private var reconnectAfterTeardown = false
@@ -440,10 +436,79 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     private static let maximumAutomaticReconnectAttempts = 2
     private static let maximumQueuedWrites = 128
 
+    #if canImport(CoreBluetooth)
     override init() {
         super.init()
         restoreOnConnectEnabled = HeadphoneProfileStore.isRestoreEnabled(for: "bowers-wilkins")
         central = CBCentralManager(delegate: self, queue: nil)
+    }
+
+    init(transport: (any BowersWilkinsTransportProtocol)? = nil) {
+        super.init()
+        self.transport = transport
+        restoreOnConnectEnabled = HeadphoneProfileStore.isRestoreEnabled(for: "bowers-wilkins")
+        if let transport {
+            configureTransport(transport)
+        } else {
+            central = CBCentralManager(delegate: self, queue: nil)
+        }
+    }
+    #else
+    init(transport: (any BowersWilkinsTransportProtocol)? = nil) {
+        super.init()
+        self.transport = transport
+        restoreOnConnectEnabled = HeadphoneProfileStore.isRestoreEnabled(for: "bowers-wilkins")
+        if let transport {
+            configureTransport(transport)
+        }
+    }
+    #endif
+
+    func configureTransport(_ transport: any BowersWilkinsTransportProtocol) {
+        self.transport = transport
+        transport.onConnectionStateChange = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .idle:
+                self.phase = .idle
+            case .scanning:
+                self.phase = .scanning
+            case .connecting:
+                self.phase = .connecting
+            case .ready:
+                self.phase = .ready
+                self.transportReadiness = BWRPCTransportReadiness(
+                    requestDiscovered: true,
+                    responseDiscovered: true,
+                    responseNotificationsConfirmed: true
+                )
+                if let name = transport.connectedDeviceName {
+                    self.connectedName = name
+                    self.connectedAdvertisedName = name
+                }
+                if let addr = transport.connectedDeviceAddress {
+                    self.macAddress = addr
+                }
+                self.refreshANCWireProfile()
+                self.didStartInitialRefresh = false
+                self.transportMayBeReady()
+            case .failed(let msg):
+                self.phase = .failed(msg)
+            }
+        }
+        transport.onResponseData = { [weak self] data in
+            self?.handle(data)
+            self?.cancelWriteTimeout()
+            self?.writeInFlight = false
+            self?.activeWriteCommandKey = nil
+            self?.pumpWriteQueue()
+        }
+        transport.onNotificationData = { [weak self] data in
+            self?.handle(data)
+        }
+        transport.onLog = { [weak self] direction, text in
+            self?.addLog(direction, text)
+        }
     }
 
     deinit {
@@ -454,6 +519,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         connectionTimeoutWorkItem?.cancel()
         teardownTimeoutWorkItem?.cancel()
         refreshWorkItems.values.forEach { $0.cancel() }
+        #if canImport(CoreBluetooth)
         if let peripheral,
             let peripheralDelegateProxy,
             peripheral.delegate === peripheralDelegateProxy
@@ -461,13 +527,22 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             peripheral.delegate = nil
         }
         central?.delegate = nil
+        #endif
     }
 
     var isReady: Bool { phase == .ready }
 
     func startScanning() {
         cancelAutomaticReconnect()
-        startScanning(automatically: false)
+        #if canImport(CoreBluetooth)
+        if let transport {
+            transport.startScan()
+        } else {
+            startScanning(automatically: false)
+        }
+        #else
+        transport?.startScan()
+        #endif
     }
 
     func setDiagnosticsEnabled(_ enabled: Bool) {
@@ -487,6 +562,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     private func startScanning(automatically: Bool) {
+        #if canImport(CoreBluetooth)
         guard central.state == .poweredOn else {
             cancelConnectionTimeout()
             phase = .bluetoothUnavailable
@@ -529,14 +605,19 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         }
         scanTimeoutWorkItem = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+        #else
+        transport?.startScan()
+        #endif
     }
 
     func connectSelected() {
+        #if canImport(CoreBluetooth)
         guard let id = selectedPeripheralID, let item = discovered[id] else { return }
         automaticConnection.isSuppressed = false
         identityRejections.reset()
         cancelAutomaticReconnect()
         connect(item, automatically: false)
+        #endif
     }
 
     func updateBluetoothPairedDevices(_ devices: [BluetoothPairedDevice]) {
@@ -554,7 +635,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     /// Limited to generic advertisers: the address equality is
     /// hardware-verified on the original Px8 only.
     private func verifyGenericPeripheralIdentity() {
-        guard isReady, let peripheral,
+        guard isReady,
             let connectedAdvertisedName, Self.isGenericAdvertisedName(connectedAdvertisedName)
         else { return }
         switch Self.addressVerdict(reported: macAddress, pairedConnected: connectedPairedAddresses) {
@@ -565,18 +646,28 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         case .mismatch:
             addLog(
                 .info, "Control link reports \(macAddress), which is not a connected paired headphone; dropping it")
-            rejectedPeripheralIDs.insert(peripheral.identifier)
+            #if canImport(CoreBluetooth)
+            if let peripheral {
+                rejectedPeripheralIDs.insert(peripheral.identifier)
+            }
+            #endif
             identityRejections.recordRejection()
             if identityRejections.isExhausted {
                 // Stay disconnected until the audio route changes, Bluetooth
                 // restarts, or the user connects manually.
                 automaticConnection.isSuppressed = true
             }
-            failTransport("Control link belongs to another headphone", peripheral: peripheral)
+            #if canImport(CoreBluetooth)
+            if let peripheral {
+                failTransport("Control link belongs to another headphone", peripheral: peripheral)
+            }
+            #else
+            disconnect()
+            #endif
         }
     }
 
-    static func addressVerdict(reported: String, pairedConnected: [String]) -> BWPeripheralAddressVerdict {
+    nonisolated static func addressVerdict(reported: String, pairedConnected: [String]) -> BWPeripheralAddressVerdict {
         guard let reported = normalizedMACAddress(reported) else { return .unknown }
         let paired = pairedConnected.compactMap(normalizedMACAddress)
         guard !paired.isEmpty else { return .unknown }
@@ -599,6 +690,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             automaticConnection.isSuppressed = false
             cancelAutomaticReconnect()
         }
+        #if canImport(CoreBluetooth)
         if names.isEmpty {
             cancelAutomaticReconnect()
             cancelScanTimeout()
@@ -620,8 +712,16 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             startScanning(automatically: true)
         }
         tryAutomaticConnection()
+        #else
+        if names.isEmpty {
+            disconnect()
+        } else if phase.canStartAutomaticScan {
+            transport?.startScan()
+        }
+        #endif
     }
 
+    #if canImport(CoreBluetooth)
     private func connect(_ item: DiscoveredPeripheral, automatically: Bool) {
         guard phase != .connecting, phase != .discovering, phase != .ready else { return }
         guard teardownPeripheral == nil else {
@@ -711,6 +811,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         )
         central.connect(item.peripheral)
     }
+    #endif
 
     func disconnect() {
         automaticConnection.isSuppressed = true
@@ -718,13 +819,18 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         pendingConnection = nil
         cancelScanTimeout()
         cancelConnectionTimeout()
+        #if canImport(CoreBluetooth)
         cancelTeardownTracking()
-        central.stopScan()
+        central?.stopScan()
         let disconnectedPeripheral = releasePeripheral()
-        if let disconnectedPeripheral { central.cancelPeripheralConnection(disconnectedPeripheral) }
+        if let disconnectedPeripheral { central?.cancelPeripheralConnection(disconnectedPeripheral) }
+        #else
+        transport?.disconnect()
+        #endif
         phase = .idle
     }
 
+    #if canImport(CoreBluetooth)
     private func tryAutomaticConnection() {
         guard !automaticConnection.isSuppressed,
             phase == .scanning || phase == .idle,
@@ -755,8 +861,9 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         addLog(.info, "Core Audio already has \(item.name) connected; starting BLE RPC automatically")
         connect(item, automatically: true)
     }
+    #endif
 
-    static func deviceNamesMatch(_ lhs: String, _ rhs: String) -> Bool {
+    nonisolated static func deviceNamesMatch(_ lhs: String, _ rhs: String) -> Bool {
         BluetoothDeviceNameMatcher.matches(lhs, rhs)
     }
 
@@ -767,7 +874,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     /// Recent Bowers & Wilkins headphones share the same RPC discovery path.
     /// The GATT service/characteristics remain the final compatibility check;
     /// this list only prevents unrelated Bluetooth devices from being probed.
-    static func isSupportedHeadphoneName(_ name: String) -> Bool {
+    nonisolated static func isSupportedHeadphoneName(_ name: String) -> Bool {
         let normalized = BluetoothDeviceNameMatcher.normalized(name)
 
         if normalized.contains("bowerswilkins"),
@@ -783,20 +890,20 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     /// Some headphones advertise over BLE under a shared vendor name instead
     /// of their model name. Hardware-verified: the original Px8 advertises as
     /// `LE_BWHP` while Core Audio reports `Px8`.
-    static func isGenericAdvertisedName(_ name: String) -> Bool {
+    nonisolated static func isGenericAdvertisedName(_ name: String) -> Bool {
         BluetoothDeviceNameMatcher.normalized(name) == "lebwhp"
     }
 
     /// How long a scan must have run before a generic advertisement may be
     /// chosen automatically.
-    static let genericFallbackGrace: TimeInterval = 2
+    nonisolated static let genericFallbackGrace: TimeInterval = 2
 
-    static func allowsGenericFallback(scanStartedAt: Date?, now: Date) -> Bool {
+    nonisolated static func allowsGenericFallback(scanStartedAt: Date?, now: Date) -> Bool {
         guard let scanStartedAt else { return true }
         return now.timeIntervalSince(scanStartedAt) >= genericFallbackGrace
     }
 
-    static func isDiscoverableAdvertisedName(_ name: String) -> Bool {
+    nonisolated static func isDiscoverableAdvertisedName(_ name: String) -> Bool {
         isSupportedHeadphoneName(name) || isGenericAdvertisedName(name)
     }
 
@@ -816,19 +923,34 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         )
     }
 
-    /// A generic advertisement does not identify the model, so the Px8 values
-    /// apply only when the one connected Bowers & Wilkins audio output is an
-    /// original Px8. Any other generically advertised model is unverified.
-    static func ancWireProfile(advertisedName: String, audioDeviceNames: [String]) -> ANCWireProfile {
+    /// A generic advertisement does not identify the model, so the verified values
+    /// apply when the connected model is an original Px8 or Px7 S2 / Px7 S2e
+    /// (hardware-verified). Any other generically advertised model is unverified.
+    nonisolated static func ancWireProfile(advertisedName: String, audioDeviceNames: [String]) -> ANCWireProfile {
+        if isPx8OrPx7S2FamilyName(advertisedName) {
+            return .originalPx8
+        }
         guard isGenericAdvertisedName(advertisedName) else { return .standard }
         guard audioDeviceNames.count == 1, let audioName = audioDeviceNames.first,
-            isOriginalPx8Name(audioName)
+            isPx8OrPx7S2FamilyName(audioName)
         else { return .unverified }
         return .originalPx8
     }
 
-    static func isOriginalPx8Name(_ name: String) -> Bool {
-        ["px8", "bowerswilkinspx8"].contains(BluetoothDeviceNameMatcher.normalized(name))
+    nonisolated static func isOriginalPx8Name(_ name: String) -> Bool {
+        isPx8OrPx7S2FamilyName(name)
+    }
+
+    nonisolated static func isPx8OrPx7S2FamilyName(_ name: String) -> Bool {
+        let normalized = BluetoothDeviceNameMatcher.normalized(name)
+        if ["px8", "bowerswilkinspx8"].contains(normalized) ||
+           (normalized.contains("px8") && !normalized.contains("px8s2")) {
+            return true
+        }
+        if normalized.contains("px7s2") || normalized.contains("px7s2e") {
+            return true
+        }
+        return false
     }
 
     private func displayName(for item: DiscoveredPeripheral) -> String {
@@ -840,6 +962,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     private func scheduleAutomaticReconnect() {
+        #if canImport(CoreBluetooth)
         guard !automaticConnection.isSuppressed,
             !audioConnectedDeviceNames.isEmpty,
             automaticReconnectTask == nil,
@@ -872,6 +995,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             self.automaticConnection.resetCandidates()
             self.startScanning(automatically: true)
         }
+        #endif
     }
 
     private func cancelAutomaticReconnect(resetAttempt: Bool = true) {
@@ -880,6 +1004,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         if resetAttempt { automaticConnection.reconnectAttempt = 0 }
     }
 
+    #if canImport(CoreBluetooth)
     private func armConnectionTimeout(
         for peripheralID: UUID,
         expectedPhase: Phase,
@@ -912,6 +1037,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         connectionTimeoutWorkItem = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: timeout)
     }
+    #endif
 
     private func cancelConnectionTimeout() {
         connectionTimeoutWorkItem?.cancel()
@@ -939,7 +1065,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     func setANC(_ mode: ANCMode) {
         guard let wireValue = ancWireProfile.wireValue(for: mode) else { return }
         ancMode = mode
-        send(BWRPCatalog.ancSet, payload: .int(Int64(wireValue)))
+        send(BWRPCatalog.ancSet, payload: .int(Int64(wireValue)), priority: true)
         refresh(BWRPCatalog.ancGet)
         persistDesiredProfile()
     }
@@ -950,38 +1076,46 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     func commitEQ() {
-        send(BWRPCatalog.eqSet, payload: .array(eqValues.map { .int(Int64($0)) }))
+        send(BWRPCatalog.eqSet, payload: .array(eqValues.map { .int(Int64($0)) }), priority: true)
         refresh(BWRPCatalog.eqGet)
         persistDesiredProfile()
     }
 
     func setEQBypassed(_ bypassed: Bool) {
         eqBypassed = bypassed
-        send(BWRPCatalog.eqBypassSet, payload: .bool(bypassed))
+        send(BWRPCatalog.eqBypassSet, payload: .bool(bypassed), priority: true)
         refresh(BWRPCatalog.eqBypassGet)
         persistDesiredProfile()
     }
 
     /// Two-band tone control used by headphones without the five-band EQ.
-    static let toneRange = -60...60
+    nonisolated static let toneRange = -60...60
 
     var supportsToneControls: Bool {
         Self.supportsToneControls(confirmedReads)
     }
 
+    func hasConfirmedRead(_ command: BWRPCCommand) -> Bool {
+        confirmedReads.contains(command.key)
+    }
+
+    func isCommandInFlightOrQueued(_ command: BWRPCCommand) -> Bool {
+        activeWriteCommandKey == command.key || writeQueue.contains(commandKey: command.key)
+    }
+
     /// Both reads must have answered with device error `0`.
-    static func supportsToneControls(_ confirmed: BWConfirmedReads) -> Bool {
+    nonisolated static func supportsToneControls(_ confirmed: BWConfirmedReads) -> Bool {
         confirmed.contains(BWRPCatalog.bassGet.key) && confirmed.contains(BWRPCatalog.trebleGet.key)
     }
 
     /// Accepts only an in-range integer reply; anything else leaves the
     /// published level unchanged.
-    static func toneLevel(from payload: MessagePackValue) -> Int? {
+    nonisolated static func toneLevel(from payload: MessagePackValue) -> Int? {
         guard let value = payload.intValue, toneRange.contains(value) else { return nil }
         return value
     }
 
-    static func clampedTone(_ value: Int) -> Int {
+    nonisolated static func clampedTone(_ value: Int) -> Int {
         min(toneRange.upperBound, max(toneRange.lowerBound, value))
     }
 
@@ -994,13 +1128,13 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     func commitBass() {
-        send(BWRPCatalog.bassSet, payload: .int(Int64(bassLevel)))
+        send(BWRPCatalog.bassSet, payload: .int(Int64(bassLevel)), priority: true)
         refresh(BWRPCatalog.bassGet)
         persistDesiredProfile()
     }
 
     func commitTreble() {
-        send(BWRPCatalog.trebleSet, payload: .int(Int64(trebleLevel)))
+        send(BWRPCatalog.trebleSet, payload: .int(Int64(trebleLevel)), priority: true)
         refresh(BWRPCatalog.trebleGet)
         persistDesiredProfile()
     }
@@ -1080,7 +1214,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     /// Renaming is offered only for model-named advertisers. It has not been
     /// tested on a generically advertised model, where the Core Audio name
     /// also selects the ANC wire profile.
-    static func allowsRename(advertisedName: String?) -> Bool {
+    nonisolated static func allowsRename(advertisedName: String?) -> Bool {
         guard let advertisedName else { return false }
         return !isGenericAdvertisedName(advertisedName)
     }
@@ -1114,19 +1248,30 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: scheduled)
     }
 
-    private func send(_ command: BWRPCCommand, payload: MessagePackValue? = nil) {
-        guard isReady,
-            transportReadiness.isReady,
-            requestCharacteristic != nil,
-            peripheral != nil
-        else {
+    var hasPendingWrites: Bool {
+        writeInFlight || !writeQueue.isEmpty
+    }
+
+    private func send(_ command: BWRPCCommand, payload: MessagePackValue? = nil, priority: Bool = false) {
+        guard isReady, transportReadiness.isReady else {
             addLog(.info, "Ignored \(command.name): transport is not ready")
             return
         }
+        #if canImport(CoreBluetooth)
+        guard transport != nil || (requestCharacteristic != nil && peripheral != nil) else {
+            addLog(.info, "Ignored \(command.name): transport is not ready")
+            return
+        }
+        #else
+        guard transport != nil else {
+            addLog(.info, "Ignored \(command.name): transport is not ready")
+            return
+        }
+        #endif
         let data = BWRPC.request(command, payload: payload)
         addLog(.outgoing, "\(command.name) [\(command.key)]  \(data.hexString)")
         let pending = BWRPCPendingWrite(commandKey: command.key, commandName: command.name, data: data)
-        if writeQueue.enqueue(pending) == .rejectedFull {
+        if writeQueue.enqueue(pending, priority: priority) == .rejectedFull {
             addLog(.info, "Ignored \(command.name): write queue is full")
             return
         }
@@ -1134,6 +1279,28 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     private func pumpWriteQueue() {
+        if let transport {
+            guard !writeInFlight, let pending = writeQueue.popFirst() else { return }
+            writeInFlight = true
+            activeWriteCommandKey = pending.commandKey
+            let ok = transport.writeRequest(pending.data)
+            if !ok {
+                writeInFlight = false
+                activeWriteCommandKey = nil
+                addLog(.info, "Write failed for \(pending.commandName)")
+            } else {
+                writeTimeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: Self.writeTimeout)
+                    guard let self, !Task.isCancelled, self.writeInFlight else { return }
+                    self.writeInFlight = false
+                    self.activeWriteCommandKey = nil
+                    self.addLog(.info, "Write timed out for \(pending.commandName)")
+                    self.pumpWriteQueue()
+                }
+            }
+            return
+        }
+        #if canImport(CoreBluetooth)
         guard !writeInFlight,
             let peripheral,
             let characteristic = requestCharacteristic,
@@ -1147,14 +1314,19 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         guard let pending = writeQueue.popFirst() else { return }
 
         writeInFlight = type == .withResponse
+        if type == .withResponse {
+            activeWriteCommandKey = pending.commandKey
+        }
         peripheral.writeValue(pending.data, for: characteristic, type: type)
         if type == .withResponse {
             armWriteTimeout(for: pending, identity: identity)
         } else {
             DispatchQueue.main.async { [weak self] in self?.pumpWriteQueue() }
         }
+        #endif
     }
 
+    #if canImport(CoreBluetooth)
     private func armWriteTimeout(for pending: BWRPCPendingWrite, identity: BWPeripheralSessionIdentity) {
         cancelWriteTimeout()
         writeTimeoutTask = Task { @MainActor [weak self] in
@@ -1175,12 +1347,14 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             }
         }
     }
+    #endif
 
     private func cancelWriteTimeout() {
         writeTimeoutTask?.cancel()
         writeTimeoutTask = nil
     }
 
+    #if canImport(CoreBluetooth)
     private func bindPeripheral(_ newPeripheral: CBPeripheral) {
         _ = releasePeripheral()
         transportGeneration &+= 1
@@ -1277,6 +1451,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         resetTransportState()
         return releasedPeripheral
     }
+    #endif
 
     private func resetTransportState() {
         profileRestoreTask?.cancel()
@@ -1284,12 +1459,15 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         cancelWriteTimeout()
         refreshWorkItems.values.forEach { $0.cancel() }
         refreshWorkItems.removeAll(keepingCapacity: true)
+        #if canImport(CoreBluetooth)
         requestCharacteristic = nil
         responseCharacteristic = nil
         eventCharacteristic = nil
+        #endif
         transportReadiness = BWRPCTransportReadiness()
         writeQueue.removeAll()
         writeInFlight = false
+        activeWriteCommandKey = nil
         didStartInitialRefresh = false
         restoredProfileDeviceID = nil
         nextPairedDeviceIndex = nil
@@ -1324,15 +1502,20 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     private func transportMayBeReady() {
+        #if canImport(CoreBluetooth)
         guard transportReadiness.isReady,
-            requestCharacteristic != nil,
-            responseCharacteristic != nil
+            transport != nil || (requestCharacteristic != nil && responseCharacteristic != nil)
         else { return }
+        #else
+        guard transportReadiness.isReady else { return }
+        #endif
         cancelConnectionTimeout()
         cancelAutomaticReconnect()
         phase = .ready
         cancelScanTimeout()
-        central.stopScan()
+        #if canImport(CoreBluetooth)
+        central?.stopScan()
+        #endif
         guard !didStartInitialRefresh else { return }
         didStartInitialRefresh = true
         addLog(.info, "B&W RPC characteristics discovered")
@@ -1577,7 +1760,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         }
     }
 
-    static func persistentDeviceIdentifier(macAddress: String, serialNumber: String) -> String? {
+    nonisolated static func persistentDeviceIdentifier(macAddress: String, serialNumber: String) -> String? {
         if let address = normalizedMACAddress(macAddress) {
             return "mac:\(address.lowercased())"
         }
@@ -1591,7 +1774,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         return "serial:\(serial.lowercased())"
     }
 
-    static func normalizedMACAddress(_ value: String) -> String? {
+    nonisolated static func normalizedMACAddress(_ value: String) -> String? {
         let payload = value.lowercased().hasPrefix("0x") ? String(value.dropFirst(2)) : value
         let hexadecimal = payload.uppercased().filter(\.isHexDigit)
         guard hexadecimal.count == 12 else { return nil }
@@ -1605,13 +1788,13 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         return groups.joined(separator: ":")
     }
 
-    private static func embeddedInt(_ payload: MessagePackValue) -> Int? {
+    private nonisolated static func embeddedInt(_ payload: MessagePackValue) -> Int? {
         if let value = payload.intValue { return value }
         guard let text = payload.stringValue else { return nil }
         return text.split(whereSeparator: { !$0.isNumber && $0 != "-" }).last.flatMap { Int($0) }
     }
 
-    private static func sourceName(_ value: Int?) -> String {
+    private nonisolated static func sourceName(_ value: Int?) -> String {
         switch value {
         case 2: "AUX"
         case 5: "USB"
@@ -1621,7 +1804,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         }
     }
 
-    private static func codecName(_ value: Int?) -> String {
+    private nonisolated static func codecName(_ value: Int?) -> String {
         switch value {
         case 0, nil: "—"
         case 1: "SBC"
@@ -1634,6 +1817,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         }
     }
 
+    #if canImport(CoreBluetooth)
     private func handlePeripheralEvent(
         _ event: BWPeripheralEvent,
         from callbackPeripheral: CBPeripheral,
@@ -1661,22 +1845,20 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
                 return
             }
             for characteristic in service.characteristics ?? [] {
-                switch characteristic.uuid.uuidString.lowercased() {
-                case BWRPC.requestUUID:
+                let uuid = characteristic.uuid.uuidString.lowercased()
+                if BWRPC.requestUUIDs.contains(uuid) {
                     requestCharacteristic = characteristic
                     transportReadiness.requestDiscovered = true
-                case BWRPC.responseUUID:
+                } else if BWRPC.responseUUIDs.contains(uuid) {
                     guard responseCharacteristic !== characteristic else { continue }
                     responseCharacteristic = characteristic
                     transportReadiness.responseDiscovered = true
                     transportReadiness.responseNotificationsConfirmed = false
                     callbackPeripheral.setNotifyValue(true, for: characteristic)
-                case BWRPC.notificationUUID:
+                } else if BWRPC.notificationUUIDs.contains(uuid) {
                     guard eventCharacteristic !== characteristic else { continue }
                     eventCharacteristic = characteristic
                     callbackPeripheral.setNotifyValue(true, for: characteristic)
-                default:
-                    break
                 }
             }
             transportMayBeReady()
@@ -1723,6 +1905,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             else { return }
             cancelWriteTimeout()
             writeInFlight = false
+            activeWriteCommandKey = nil
             if let error {
                 failTransport("GATT write failed: \(error.localizedDescription)", peripheral: callbackPeripheral)
                 return
@@ -1771,6 +1954,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             scheduleAutomaticReconnect()
         }
     }
+    #endif
 
     private func addLog(_ direction: TransportLogEntry.Direction, _ text: String) {
         guard diagnosticsEnabled else { return }
@@ -1779,6 +1963,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 }
 
+#if canImport(CoreBluetooth)
 extension BowersWilkinsProvider: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
@@ -1905,6 +2090,7 @@ extension BowersWilkinsProvider: CBCentralManagerDelegate {
         }
     }
 }
+#endif
 
 extension BowersWilkinsProvider: HeadphoneProvider {
     var providerID: String { "bowers-wilkins" }

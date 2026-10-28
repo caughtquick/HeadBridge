@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import Darwin
 import SwiftUI
@@ -259,3 +260,5 @@ struct HeadBridgeApp: App {
         }
     }
 }
+#endif
+

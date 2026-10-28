@@ -1,14 +1,16 @@
-import Darwin
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 
-struct BluetoothPairedDevice: Identifiable, Equatable, Sendable {
-    let id: String
-    let name: String
-    let address: String
-    let isConnected: Bool
-    let isAudioConnected: Bool
+public struct BluetoothPairedDevice: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let address: String
+    public let isConnected: Bool
+    public let isAudioConnected: Bool
 
-    init(
+    public init(
         id: String,
         name: String,
         address: String,
@@ -23,6 +25,7 @@ struct BluetoothPairedDevice: Identifiable, Equatable, Sendable {
     }
 }
 
+#if os(macOS)
 private final class BluetoothInventoryDataBox: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
@@ -141,9 +144,10 @@ final class BluetoothInventoryQuery: @unchecked Sendable {
         lock.unlock()
     }
 }
+#endif
 
-enum BluetoothDeviceInventory {
-    static func decode(_ data: Data) -> [BluetoothPairedDevice]? {
+public enum BluetoothDeviceInventory {
+    public static func decode(_ data: Data) -> [BluetoothPairedDevice]? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let profiles = root["SPBluetoothDataType"] as? [[String: Any]]
         else {

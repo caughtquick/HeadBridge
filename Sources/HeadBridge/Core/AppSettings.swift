@@ -1,16 +1,16 @@
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
-import OSLog
-import ServiceManagement
 
-enum BatteryDisplayMode: String, CaseIterable, Identifiable {
+public enum BatteryDisplayMode: String, CaseIterable, Identifiable, Sendable {
     case never
     case low
     case always
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 
-    var title: String {
+    public var title: String {
         switch self {
         case .never: "Never"
         case .low: "Only below 20%"
@@ -18,7 +18,7 @@ enum BatteryDisplayMode: String, CaseIterable, Identifiable {
         }
     }
 
-    func shouldDisplay(level: Int?) -> Bool {
+    public func shouldDisplay(level: Int?) -> Bool {
         guard let level else { return false }
         return switch self {
         case .never: false
@@ -27,6 +27,10 @@ enum BatteryDisplayMode: String, CaseIterable, Identifiable {
         }
     }
 }
+
+#if os(macOS)
+import ServiceManagement
+#endif
 
 @MainActor
 final class AppSettings: ObservableObject {
@@ -77,6 +81,7 @@ final class AppSettings: ObservableObject {
         developerModeEnabled = defaults.bool(forKey: Key.developerMode)
         showsDockIconWithSettings = defaults.bool(forKey: Key.showsDockIconWithSettings)
 
+        #if os(macOS)
         let status = SMAppService.mainApp.status
         if defaults.object(forKey: Key.launchAtLoginRequested) == nil,
             status == .enabled || status == .requiresApproval
@@ -84,6 +89,7 @@ final class AppSettings: ObservableObject {
             defaults.set(true, forKey: Key.launchAtLoginRequested)
         }
         reconcileLaunchAtLoginRegistration()
+        #endif
     }
 
     func registerVolumeSynchronization(
@@ -124,6 +130,7 @@ final class AppSettings: ObservableObject {
             .eraseToAnyPublisher()
     }
 
+    #if os(macOS)
     func setLaunchAtLoginEnabled(_ enabled: Bool) {
         defaults.set(enabled, forKey: Key.launchAtLoginRequested)
         reconcileLaunchAtLoginRegistration()
@@ -177,4 +184,6 @@ final class AppSettings: ObservableObject {
     func openLoginItemsSettings() {
         SMAppService.openSystemSettingsLoginItems()
     }
+    #endif
 }
+

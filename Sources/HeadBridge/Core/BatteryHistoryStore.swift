@@ -1,4 +1,6 @@
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
 
 struct BatteryHistorySample: Codable, Identifiable, Equatable, Sendable {
@@ -186,6 +188,7 @@ final class BatteryHistoryStore: ObservableObject {
 
     private func observeProviders() {
         for provider in providers {
+            #if canImport(Combine)
             provider.objectWillChange
                 .debounce(for: .milliseconds(120), scheduler: RunLoop.main)
                 .sink { [weak self] _ in
@@ -194,12 +197,22 @@ final class BatteryHistoryStore: ObservableObject {
                     self.updateSamplingTimer()
                 }
                 .store(in: &providerCancellables)
+            #else
+            provider.objectWillChange
+                .sink { [weak self] in
+                    guard let self else { return }
+                    self.capture(provider, at: self.now())
+                    self.updateSamplingTimer()
+                }
+                .store(in: &providerCancellables)
+            #endif
         }
     }
 
     private func updateSamplingTimer() {
         let shouldSample = providers.contains { $0.connectionState == .ready }
         if shouldSample, samplingCancellable == nil {
+            #if canImport(Combine)
             samplingCancellable = Timer.publish(
                 every: samplingInterval,
                 tolerance: min(15, samplingInterval * 0.1),
@@ -210,6 +223,17 @@ final class BatteryHistoryStore: ObservableObject {
             .sink { [weak self] timestamp in
                 self?.sampleConnectedProviders(at: timestamp)
             }
+            #else
+            let timer = Timer.scheduledTimer(withTimeInterval: samplingInterval, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.sampleConnectedProviders(at: self.now())
+                }
+            }
+            samplingCancellable = AnyCancellable {
+                timer.invalidate()
+            }
+            #endif
         } else if !shouldSample {
             samplingCancellable?.cancel()
             samplingCancellable = nil
@@ -359,14 +383,7 @@ final class BatteryHistoryStore: ObservableObject {
     }
 
     private static func defaultStorageURL() -> URL {
-        let base =
-            FileManager.default.urls(
-                for: .applicationSupportDirectory,
-                in: .userDomainMask
-            ).first ?? FileManager.default.temporaryDirectory
-        return
-            base
-            .appendingPathComponent("HeadBridge", isDirectory: true)
+        AppPlatformPaths.dataDirectory
             .appendingPathComponent("BatteryHistory.plist", isDirectory: false)
     }
 }

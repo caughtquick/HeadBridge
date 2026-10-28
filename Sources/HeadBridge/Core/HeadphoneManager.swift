@@ -1,6 +1,10 @@
+#if canImport(Combine)
 import Combine
-import CoreAudio
+#endif
 import Foundation
+#if canImport(CoreAudio)
+import CoreAudio
+#endif
 
 private struct HeadphoneVolumeSyncState: Equatable {
     let normalizedVolume: Float
@@ -9,14 +13,32 @@ private struct HeadphoneVolumeSyncState: Equatable {
     let providerReady: Bool
 }
 
-struct RecognizedHeadphoneDevice: Identifiable, Equatable {
-    let id: String
-    let deviceID: String
-    let name: String
-    let address: String
-    let isConnected: Bool
-    let providerID: String
-    let vendorName: String
+public struct RecognizedHeadphoneDevice: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let deviceID: String
+    public let name: String
+    public let address: String
+    public let isConnected: Bool
+    public let providerID: String
+    public let vendorName: String
+
+    public init(
+        id: String,
+        deviceID: String,
+        name: String,
+        address: String,
+        isConnected: Bool,
+        providerID: String,
+        vendorName: String
+    ) {
+        self.id = id
+        self.deviceID = deviceID
+        self.name = name
+        self.address = address
+        self.isConnected = isConnected
+        self.providerID = providerID
+        self.vendorName = vendorName
+    }
 }
 
 @MainActor
@@ -26,7 +48,9 @@ final class HeadphoneManager: ObservableObject {
 
     private var cancellables: Set<AnyCancellable> = []
     private var isShutdown = false
+    #if os(macOS)
     private var inventoryQuery: BluetoothInventoryQuery?
+    #endif
     private var inventoryGeneration = 0
     private var isRefreshingInventory = false
     private var needsInventoryRefresh = false
@@ -59,7 +83,7 @@ final class HeadphoneManager: ObservableObject {
         providers.first { $0.providerID == providerID }
     }
 
-    func activeProvider(systemAudio: SystemAudioController) -> (any HeadphoneProvider)? {
+    func activeProvider(systemAudio: any AudioControllerProtocol) -> (any HeadphoneProvider)? {
         guard let id = systemAudio.defaultDeviceID,
             let device = systemAudio.devices.first(where: { $0.id == id })
         else { return nil }
@@ -70,8 +94,8 @@ final class HeadphoneManager: ObservableObject {
         providers.forEach { $0.updateAudioConnectedDevices(devices) }
     }
 
-    func installAudioDeviceDiscovery(systemAudio: SystemAudioController) {
-        systemAudio.$devices
+    func installAudioDeviceDiscovery(systemAudio: any AudioControllerProtocol) {
+        systemAudio.devicesPublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] devices in
                 self?.updateAudioConnectedDevices(devices)
@@ -95,6 +119,8 @@ final class HeadphoneManager: ObservableObject {
         isRefreshingInventory = true
         inventoryGeneration &+= 1
         let expectedGeneration = inventoryGeneration
+
+        #if os(macOS)
         let query = BluetoothInventoryQuery()
         inventoryQuery = query
 
@@ -119,6 +145,27 @@ final class HeadphoneManager: ObservableObject {
                 }
             }
         }
+        #else
+        Self.inventoryQueue.async {
+            let devices = LinuxBluetoothInventory.fetchPairedDevices()
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                    !self.isShutdown,
+                    self.inventoryGeneration == expectedGeneration
+                else { return }
+
+                self.isRefreshingInventory = false
+                if let devices {
+                    self.applyBluetoothPairedDevices(devices)
+                }
+
+                if self.needsInventoryRefresh {
+                    self.needsInventoryRefresh = false
+                    self.refreshBluetoothDevices()
+                }
+            }
+        }
+        #endif
     }
 
     func applyBluetoothPairedDevices(_ devices: [BluetoothPairedDevice]) {
@@ -159,14 +206,17 @@ final class HeadphoneManager: ObservableObject {
         guard !isShutdown else { return }
         isShutdown = true
         inventoryGeneration &+= 1
+        #if os(macOS)
         inventoryQuery?.cancel()
         inventoryQuery = nil
+        #endif
         isRefreshingInventory = false
         needsInventoryRefresh = false
         cancellables.removeAll()
         providers.forEach { $0.shutdown() }
     }
 
+    #if os(macOS)
     func installVolumeSynchronization(
         settings: AppSettings,
         systemAudio: SystemAudioController
@@ -184,17 +234,17 @@ final class HeadphoneManager: ObservableObject {
         }
     }
 
-    private func installVolumeSynchronization(
+    func installVolumeSynchronization(
         provider: any HeadphoneProvider,
         enabled: AnyPublisher<Bool, Never>,
-        systemAudio: SystemAudioController
+        systemAudio: any AudioControllerProtocol
     ) {
-        let audioState = systemAudio.$volume
-            .combineLatest(systemAudio.$defaultDeviceID)
+        let audioState = systemAudio.volumePublisher
+            .combineLatest(systemAudio.defaultDeviceIDPublisher)
         let providerState =
             enabled
             .combineLatest(provider.connectionStatePublisher)
-        weak let weakProvider = provider
+        weak var weakProvider = provider
 
         audioState
             .combineLatest(providerState)
@@ -222,4 +272,5 @@ final class HeadphoneManager: ObservableObject {
             }
             .store(in: &cancellables)
     }
+    #endif
 }

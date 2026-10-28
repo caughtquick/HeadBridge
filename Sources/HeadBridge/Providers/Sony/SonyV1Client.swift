@@ -1,8 +1,9 @@
 import Foundation
-import IOBluetooth
+#if canImport(OSLog)
 import OSLog
+#endif
 
-enum SonyV1ClientConnectionState: Equatable {
+public enum SonyV1ClientConnectionState: Equatable, Sendable {
     case disconnected
     case connecting
     case ready
@@ -35,7 +36,7 @@ final class SonyV1Client {
         var attempt: Int
     }
 
-    private let transport: SonyRFCOMMTransport
+    private let transport: any SonyRFCOMMTransportProtocol
     private let parser = SonyMDRFrameParser()
     private let logger = Logger(subsystem: "io.github.herenickname.HeadBridge", category: "SonyV1")
 
@@ -60,10 +61,14 @@ final class SonyV1Client {
     private static let maximumQueuedCommands = 128
 
     convenience init() {
+        #if os(macOS)
         self.init(transport: SonyRFCOMMTransport())
+        #else
+        self.init(transport: LinuxSonyRFCOMMTransport())
+        #endif
     }
 
-    init(transport: SonyRFCOMMTransport) {
+    init(transport: any SonyRFCOMMTransportProtocol) {
         self.transport = transport
         transport.onStatusChange = { [weak self] status in
             self?.handleTransportStatus(status)

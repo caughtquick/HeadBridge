@@ -84,5 +84,20 @@ allocating from values supplied by a Bluetooth peer.
 Provider tests should cover name matching, value/range mapping, protocol frame
 encoding, malformed/oversized input, queue coalescing, cleanup/reconnection,
 stale callbacks, and Bluetooth power cycling. Hardware verification must record
-the model, firmware, macOS version, codec, and tested controls in the README or
+the model, firmware, OS version, codec, and tested controls in the README or
 the pull request.
+
+## Cross-platform transports (macOS and Linux)
+
+Providers decouple high-level protocol state from platform Bluetooth and audio implementations using dependency injection:
+
+- **Bowers & Wilkins (`BowersWilkinsTransportProtocol`)**:
+  - **macOS**: `CoreBluetooth` GATT peripheral session (`CBCentralManager`, `CBPeripheralDelegate`).
+  - **Linux**: `LinuxBowersWilkinsTransport` managing BlueZ GATT characteristics via D-Bus (`busctl`).
+- **Sony MDR V1 (`SonyRFCOMMTransportProtocol`)**:
+  - **macOS**: `IOBluetooth` RFCOMM channel (`IOBluetoothRFCOMMChannel`).
+  - **Linux**: `LinuxSonyRFCOMMTransport` managing native Linux `AF_BLUETOOTH` / `BTPROTO_RFCOMM` POSIX sockets.
+- **System Audio (`AudioControllerProtocol`)**:
+  - **macOS**: `SystemAudioController` using Core Audio HAL and AudioObject listeners.
+  - **Linux**: `LinuxPipeWireAudio` using PipeWire and PulseAudio interfaces (`pactl` / `wpctl`).
+

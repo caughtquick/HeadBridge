@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import CoreAudio
 import SwiftUI
@@ -945,3 +946,5 @@ private struct SelectionPopoverRow<Option: Identifiable & Equatable>: View {
         }
     }
 }
+#endif
+

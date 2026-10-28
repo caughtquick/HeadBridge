@@ -1,18 +1,30 @@
+#if canImport(Combine)
+import Combine
+#endif
+import Foundation
+#if os(macOS)
 import AudioToolbox
 import CoreAudio
-import Foundation
+#endif
 
-struct SystemAudioDevice: Identifiable, Equatable {
-    let id: AudioDeviceID
-    let uid: String
-    let name: String
-    let transportType: UInt32
+public struct SystemAudioDevice: Identifiable, Equatable, Sendable {
+    public let id: AudioDeviceID
+    public let uid: String
+    public let name: String
+    public let transportType: UInt32
 
-    var isBluetooth: Bool {
+    public init(id: AudioDeviceID, uid: String, name: String, transportType: UInt32) {
+        self.id = id
+        self.uid = uid
+        self.name = name
+        self.transportType = transportType
+    }
+
+    public var isBluetooth: Bool {
         transportType == kAudioDeviceTransportTypeBluetooth || transportType == kAudioDeviceTransportTypeBluetoothLE
     }
 
-    var iconName: String {
+    public var iconName: String {
         switch transportType {
         case kAudioDeviceTransportTypeBuiltIn:
             return "laptopcomputer"
@@ -29,7 +41,7 @@ struct SystemAudioDevice: Identifiable, Equatable {
         }
     }
 
-    var inputIconName: String {
+    public var inputIconName: String {
         switch transportType {
         case kAudioDeviceTransportTypeBuiltIn:
             return "laptopcomputer"
@@ -43,8 +55,13 @@ struct SystemAudioDevice: Identifiable, Equatable {
     }
 }
 
+#if os(macOS)
 @MainActor
-final class SystemAudioController: ObservableObject {
+final class SystemAudioController: ObservableObject, AudioControllerProtocol {
+    var devicesPublisher: AnyPublisher<[SystemAudioDevice], Never> { $devices.eraseToAnyPublisher() }
+    var volumePublisher: AnyPublisher<Float, Never> { $volume.eraseToAnyPublisher() }
+    var defaultDeviceIDPublisher: AnyPublisher<AudioDeviceID?, Never> { $defaultDeviceID.eraseToAnyPublisher() }
+
     @Published private(set) var devices: [SystemAudioDevice] = []
     @Published private(set) var inputDevices: [SystemAudioDevice] = []
     @Published private(set) var defaultDeviceID: AudioDeviceID?
@@ -499,3 +516,5 @@ final class SystemAudioController: ObservableObject {
             == noErr
     }
 }
+#endif
+

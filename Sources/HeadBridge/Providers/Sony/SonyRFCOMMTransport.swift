@@ -1,13 +1,7 @@
+#if os(macOS)
 import Foundation
 import IOBluetooth
 import OSLog
-
-enum SonyRFCOMMStatus: Equatable {
-    case idle
-    case connecting
-    case connected
-    case failed(String)
-}
 
 /// A single-owner RFCOMM transport for Sony's MDR control service.
 ///
@@ -15,7 +9,7 @@ enum SonyRFCOMMStatus: Equatable {
 /// closes the old channel first, preventing the leaked DLCIs that eventually
 /// make IOBluetooth report that the system reached its session limit.
 @MainActor
-final class SonyRFCOMMTransport: NSObject {
+final class SonyRFCOMMTransport: NSObject, SonyRFCOMMTransportProtocol {
     var onStatusChange: ((SonyRFCOMMStatus) -> Void)?
     var onData: ((Data) -> Void)?
 
@@ -278,3 +272,5 @@ extension SonyRFCOMMTransport: IOBluetoothRFCOMMChannelDelegate {
         }
     }
 }
+#endif
+
