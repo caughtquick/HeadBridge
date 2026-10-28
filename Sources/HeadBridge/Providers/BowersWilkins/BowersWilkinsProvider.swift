@@ -168,14 +168,24 @@ struct BWRPCWriteQueue {
         self.capacity = capacity
     }
 
+    var isEmpty: Bool { items.isEmpty }
+
+    func contains(commandKey: String) -> Bool {
+        items.contains { $0.commandKey == commandKey }
+    }
+
     @discardableResult
-    mutating func enqueue(_ pending: BWRPCPendingWrite) -> EnqueueResult {
+    mutating func enqueue(_ pending: BWRPCPendingWrite, priority: Bool = false) -> EnqueueResult {
         if let existing = items.lastIndex(where: { $0.commandKey == pending.commandKey }) {
             items[existing] = pending
             return .replaced
         }
         guard items.count < capacity else { return .rejectedFull }
-        items.append(pending)
+        if priority {
+            items.insert(pending, at: 0)
+        } else {
+            items.append(pending)
+        }
         return .appended
     }
 
@@ -394,6 +404,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     private var transportReadiness = BWRPCTransportReadiness()
     private var writeQueue = BWRPCWriteQueue(capacity: BowersWilkinsProvider.maximumQueuedWrites)
     private var writeInFlight = false
+    private var activeWriteCommandKey: String? = nil
     private var writeTimeoutTask: Task<Void, Never>?
     private var refreshWorkItems: [String: DispatchWorkItem] = [:]
     private var didStartInitialRefresh = false
@@ -477,6 +488,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
                 if let addr = transport.connectedDeviceAddress {
                     self.macAddress = addr
                 }
+                self.refreshANCWireProfile()
                 self.didStartInitialRefresh = false
                 self.transportMayBeReady()
             case .failed(let msg):
@@ -487,6 +499,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             self?.handle(data)
             self?.cancelWriteTimeout()
             self?.writeInFlight = false
+            self?.activeWriteCommandKey = nil
             self?.pumpWriteQueue()
         }
         transport.onNotificationData = { [weak self] data in
@@ -909,19 +922,33 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         )
     }
 
-    /// A generic advertisement does not identify the model, so the Px8 values
-    /// apply only when the one connected Bowers & Wilkins audio output is an
-    /// original Px8. Any other generically advertised model is unverified.
+    /// A generic advertisement does not identify the model, so the verified values
+    /// apply when the connected model is an original Px8 or Px7 S2 / Px7 S2e
+    /// (hardware-verified). Any other generically advertised model is unverified.
     nonisolated static func ancWireProfile(advertisedName: String, audioDeviceNames: [String]) -> ANCWireProfile {
+        if isPx8OrPx7S2FamilyName(advertisedName) {
+            return .originalPx8
+        }
         guard isGenericAdvertisedName(advertisedName) else { return .standard }
         guard audioDeviceNames.count == 1, let audioName = audioDeviceNames.first,
-            isOriginalPx8Name(audioName)
+            isPx8OrPx7S2FamilyName(audioName)
         else { return .unverified }
         return .originalPx8
     }
 
     nonisolated static func isOriginalPx8Name(_ name: String) -> Bool {
-        ["px8", "bowerswilkinspx8"].contains(BluetoothDeviceNameMatcher.normalized(name))
+        isPx8OrPx7S2FamilyName(name)
+    }
+
+    nonisolated static func isPx8OrPx7S2FamilyName(_ name: String) -> Bool {
+        let normalized = BluetoothDeviceNameMatcher.normalized(name)
+        if ["px8", "bowerswilkinspx8"].contains(normalized) {
+            return true
+        }
+        if normalized.contains("px7s2") || normalized.contains("px7s2e") {
+            return true
+        }
+        return false
     }
 
     private func displayName(for item: DiscoveredPeripheral) -> String {
@@ -1036,7 +1063,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     func setANC(_ mode: ANCMode) {
         guard let wireValue = ancWireProfile.wireValue(for: mode) else { return }
         ancMode = mode
-        send(BWRPCatalog.ancSet, payload: .int(Int64(wireValue)))
+        send(BWRPCatalog.ancSet, payload: .int(Int64(wireValue)), priority: true)
         refresh(BWRPCatalog.ancGet)
         persistDesiredProfile()
     }
@@ -1047,23 +1074,31 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     func commitEQ() {
-        send(BWRPCatalog.eqSet, payload: .array(eqValues.map { .int(Int64($0)) }))
+        send(BWRPCatalog.eqSet, payload: .array(eqValues.map { .int(Int64($0)) }), priority: true)
         refresh(BWRPCatalog.eqGet)
         persistDesiredProfile()
     }
 
     func setEQBypassed(_ bypassed: Bool) {
         eqBypassed = bypassed
-        send(BWRPCatalog.eqBypassSet, payload: .bool(bypassed))
+        send(BWRPCatalog.eqBypassSet, payload: .bool(bypassed), priority: true)
         refresh(BWRPCatalog.eqBypassGet)
         persistDesiredProfile()
     }
 
     /// Two-band tone control used by headphones without the five-band EQ.
-    static let toneRange = -60...60
+    nonisolated static let toneRange = -60...60
 
     var supportsToneControls: Bool {
         Self.supportsToneControls(confirmedReads)
+    }
+
+    func hasConfirmedRead(_ command: BWRPCCommand) -> Bool {
+        confirmedReads.contains(command.key)
+    }
+
+    func isCommandInFlightOrQueued(_ command: BWRPCCommand) -> Bool {
+        activeWriteCommandKey == command.key || writeQueue.contains(commandKey: command.key)
     }
 
     /// Both reads must have answered with device error `0`.
@@ -1091,13 +1126,13 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 
     func commitBass() {
-        send(BWRPCatalog.bassSet, payload: .int(Int64(bassLevel)))
+        send(BWRPCatalog.bassSet, payload: .int(Int64(bassLevel)), priority: true)
         refresh(BWRPCatalog.bassGet)
         persistDesiredProfile()
     }
 
     func commitTreble() {
-        send(BWRPCatalog.trebleSet, payload: .int(Int64(trebleLevel)))
+        send(BWRPCatalog.trebleSet, payload: .int(Int64(trebleLevel)), priority: true)
         refresh(BWRPCatalog.trebleGet)
         persistDesiredProfile()
     }
@@ -1211,7 +1246,11 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: scheduled)
     }
 
-    private func send(_ command: BWRPCCommand, payload: MessagePackValue? = nil) {
+    var hasPendingWrites: Bool {
+        writeInFlight || !writeQueue.isEmpty
+    }
+
+    private func send(_ command: BWRPCCommand, payload: MessagePackValue? = nil, priority: Bool = false) {
         guard isReady, transportReadiness.isReady else {
             addLog(.info, "Ignored \(command.name): transport is not ready")
             return
@@ -1230,7 +1269,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         let data = BWRPC.request(command, payload: payload)
         addLog(.outgoing, "\(command.name) [\(command.key)]  \(data.hexString)")
         let pending = BWRPCPendingWrite(commandKey: command.key, commandName: command.name, data: data)
-        if writeQueue.enqueue(pending) == .rejectedFull {
+        if writeQueue.enqueue(pending, priority: priority) == .rejectedFull {
             addLog(.info, "Ignored \(command.name): write queue is full")
             return
         }
@@ -1241,15 +1280,18 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         if let transport {
             guard !writeInFlight, let pending = writeQueue.popFirst() else { return }
             writeInFlight = true
+            activeWriteCommandKey = pending.commandKey
             let ok = transport.writeRequest(pending.data)
             if !ok {
                 writeInFlight = false
+                activeWriteCommandKey = nil
                 addLog(.info, "Write failed for \(pending.commandName)")
             } else {
                 writeTimeoutTask = Task { @MainActor [weak self] in
                     try? await Task.sleep(for: Self.writeTimeout)
                     guard let self, !Task.isCancelled, self.writeInFlight else { return }
                     self.writeInFlight = false
+                    self.activeWriteCommandKey = nil
                     self.addLog(.info, "Write timed out for \(pending.commandName)")
                     self.pumpWriteQueue()
                 }
@@ -1270,6 +1312,9 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         guard let pending = writeQueue.popFirst() else { return }
 
         writeInFlight = type == .withResponse
+        if type == .withResponse {
+            activeWriteCommandKey = pending.commandKey
+        }
         peripheral.writeValue(pending.data, for: characteristic, type: type)
         if type == .withResponse {
             armWriteTimeout(for: pending, identity: identity)
@@ -1420,6 +1465,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         transportReadiness = BWRPCTransportReadiness()
         writeQueue.removeAll()
         writeInFlight = false
+        activeWriteCommandKey = nil
         didStartInitialRefresh = false
         restoredProfileDeviceID = nil
         nextPairedDeviceIndex = nil
@@ -1859,6 +1905,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             else { return }
             cancelWriteTimeout()
             writeInFlight = false
+            activeWriteCommandKey = nil
             if let error {
                 failTransport("GATT write failed: \(error.localizedDescription)", peripheral: callbackPeripheral)
                 return

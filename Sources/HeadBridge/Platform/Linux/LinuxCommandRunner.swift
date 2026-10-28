@@ -93,12 +93,16 @@ public final class LinuxCommandRunner: @unchecked Sendable {
     public func spawn(
         _ executable: String,
         arguments: [String],
+        stdinPipe: Pipe? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) -> Process? {
         let process = Process()
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
+        if let stdinPipe = stdinPipe {
+            process.standardInput = stdinPipe
+        }
 
         if let local = findExecutable(executable) {
             process.executableURL = URL(fileURLWithPath: local)
@@ -110,12 +114,23 @@ public final class LinuxCommandRunner: @unchecked Sendable {
             return nil
         }
 
+        final class LineBuffer: @unchecked Sendable {
+            var text = ""
+        }
+        let lineBuffer = LineBuffer()
+
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            if let text = String(data: data, encoding: .utf8) {
-                for line in text.split(separator: "\n") {
-                    onLine(String(line))
+            if let chunk = String(data: data, encoding: .utf8) {
+                lineBuffer.text += chunk
+                while let newlineRange = lineBuffer.text.range(of: "\n") {
+                    let line = String(lineBuffer.text[..<newlineRange.lowerBound])
+                    lineBuffer.text.removeSubrange(...newlineRange.lowerBound)
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        onLine(trimmed)
+                    }
                 }
             }
         }

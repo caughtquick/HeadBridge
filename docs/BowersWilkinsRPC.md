@@ -149,20 +149,19 @@ value range have been verified on hardware.
 The ANC mode commands (`03:01` get, `03:02` set) carry one integer, but its
 meaning differs between hardware generations:
 
-| Mode | Px7 S3 | Original Px8 |
+| Mode | Px7 S3 | Original Px8 / Px7 S2 / Px7 S2e |
 | --- | --- | --- |
 | Off | `0` | `1` |
 | Noise cancellation | `1` | `2` |
 | Pass-through | `2` | `3` |
 
-The original Px8 rejects `0` with device error `6` and acknowledges an out-of-range
+The original Px8 and Px7 S2/S2e reject `0` with device error `6` and acknowledge an out-of-range
 `4` without changing the mode. HeadBridge translates through `ANCWireProfile`.
-The Px8 column is used only when the device was discovered under the generic
-`LE_BWHP` name and the single connected Bowers & Wilkins Core Audio output is
-named `Px8`. For any other generically advertised model the values are
-unverified, so noise control stays hidden and no ANC value is written. Public
-sources list other mappings for older models (for example off/low/high/auto);
-add a profile only after confirming the values on that hardware.
+The Px8 / Px7 S2 / Px7 S2e column is used when the device is identified under the generic
+`LE_BWHP` name and the connected audio output is named `Px8`, `Px7 S2`, or `Px7 S2e`.
+For any other generically advertised model the values are unverified, so noise control
+stays hidden and no ANC value is written. Public sources list other mappings for older
+models (for example off/low/high/auto); add a profile only after confirming the values on that hardware.
 
 ## Bass and treble
 

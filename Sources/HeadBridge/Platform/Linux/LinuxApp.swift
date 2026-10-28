@@ -7,7 +7,8 @@ struct LinuxApp {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
         let isJSON = args.contains("--json")
-        let filteredArgs = args.filter { $0 != "--json" }
+        let isVerbose = args.contains("--verbose") || args.contains("-v")
+        let filteredArgs = args.filter { $0 != "--json" && $0 != "--verbose" && $0 != "-v" }
         let subcommand = filteredArgs.first ?? "status"
 
         if subcommand == "help" || subcommand == "--help" || subcommand == "-h" {
@@ -18,6 +19,11 @@ struct LinuxApp {
         let audio = LinuxPipeWireAudio()
         let bwTransport = LinuxBowersWilkinsTransport()
         let bwProvider = BowersWilkinsProvider(transport: bwTransport)
+        if isVerbose {
+            bwTransport.onLog = { dir, msg in
+                fputs("[\(dir == .outgoing ? "OUT" : "IN")] \(msg)\n", stderr)
+            }
+        }
 
         let sonyTransport = LinuxSonyRFCOMMTransport()
         let sonyClient = SonyV1Client(transport: sonyTransport)
@@ -25,6 +31,7 @@ struct LinuxApp {
 
         let manager = HeadphoneManager(providers: [bwProvider, sonyProvider])
         manager.installAudioDeviceDiscovery(systemAudio: audio)
+        manager.updateAudioConnectedDevices(audio.devices)
 
         // Populate paired devices synchronously
         if let paired = LinuxBluetoothInventory.fetchPairedDevices() {
@@ -37,9 +44,25 @@ struct LinuxApp {
             if connectedDev.providerID == "bowers-wilkins" {
                 bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
             }
-            for _ in 0..<8 {
+            for _ in 0..<15 {
                 if activeProvider(manager: manager)?.connectionState == .ready { break }
-                try? await Task.sleep(nanoseconds: 50_000_000)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if activeProvider(manager: manager)?.connectionState == .ready {
+                let isSetter = (subcommand == "anc" && filteredArgs.count > 1) ||
+                               (subcommand == "eq" && filteredArgs.count > 1) ||
+                               (subcommand == "volume" && filteredArgs.count > 1 && filteredArgs[1] == "set")
+                if !isSetter {
+                    // Wait briefly for initial capability reads to populate live state
+                    for _ in 0..<25 {
+                        if bwProvider.hasConfirmedRead(BWRPCatalog.ancGet) &&
+                           (bwProvider.supportsToneControls || bwProvider.hasConfirmedRead(BWRPCatalog.eqGet)) {
+                            break
+                        }
+                        if !bwProvider.hasPendingWrites { break }
+                        try? await Task.sleep(nanoseconds: 30_000_000)
+                    }
+                }
             }
         } else {
             // Brief delay for PipeWire audio sink discovery
@@ -66,7 +89,7 @@ struct LinuxApp {
 
         case "anc":
             let modeArg = filteredArgs.count > 1 ? filteredArgs[1] : nil
-            handleANC(modeArg: modeArg, manager: manager, isJSON: isJSON)
+            await handleANC(modeArg: modeArg, manager: manager, isJSON: isJSON)
             exit(0)
 
         case "ambient-level":
@@ -76,7 +99,7 @@ struct LinuxApp {
 
         case "eq":
             let subArgs = Array(filteredArgs.dropFirst())
-            handleEQ(args: subArgs, bwProvider: bwProvider, isJSON: isJSON)
+            await handleEQ(args: subArgs, bwProvider: bwProvider, isJSON: isJSON)
             exit(0)
 
         case "volume":
@@ -304,7 +327,7 @@ struct LinuxApp {
         }
     }
 
-    private static func handleANC(modeArg: String?, manager: HeadphoneManager, isJSON: Bool) {
+    private static func handleANC(modeArg: String?, manager: HeadphoneManager, isJSON: Bool) async {
         guard let provider = activeProvider(manager: manager) else {
             if isJSON { printJSON(["error": "No headphone connected"]) }
             else { print("Error: No headphone connected.") }
@@ -343,6 +366,11 @@ struct LinuxApp {
         }
 
         provider.setNoiseMode(mode)
+        for _ in 0..<20 {
+            if let bw = provider as? BowersWilkinsProvider, !bw.isCommandInFlightOrQueued(BWRPCatalog.ancSet) { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+
         if isJSON {
             printJSON(["success": true, "ancMode": mode.rawValue, "description": noiseModeDescription(mode)])
         } else {
@@ -370,7 +398,7 @@ struct LinuxApp {
         }
     }
 
-    private static func handleEQ(args: [String], bwProvider: BowersWilkinsProvider, isJSON: Bool) {
+    private static func handleEQ(args: [String], bwProvider: BowersWilkinsProvider, isJSON: Bool) async {
         if args.isEmpty {
             let bass = bwProvider.bassLevel
             let treble = bwProvider.trebleLevel
@@ -389,13 +417,23 @@ struct LinuxApp {
             let key = args[i].lowercased()
             if key == "bass", i + 1 < args.count, let val = Int(args[i + 1]) {
                 bwProvider.setBassLevel(val)
+                bwProvider.commitBass()
                 i += 2
             } else if key == "treble", i + 1 < args.count, let val = Int(args[i + 1]) {
                 bwProvider.setTrebleLevel(val)
+                bwProvider.commitTreble()
                 i += 2
             } else {
                 i += 1
             }
+        }
+
+        for _ in 0..<20 {
+            if !bwProvider.isCommandInFlightOrQueued(BWRPCatalog.bassSet) &&
+               !bwProvider.isCommandInFlightOrQueued(BWRPCatalog.trebleSet) {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 30_000_000)
         }
 
         if isJSON {
