@@ -26,8 +26,9 @@ enum ANCMode: Int, CaseIterable, Identifiable {
 enum ANCWireProfile: Equatable {
     /// Hardware-verified on Px7 S3: off 0, noise cancellation 1, pass-through 2.
     case standard
-    /// Hardware-verified on the original Px8 (RPC software `0(20.0.2.0)`):
-    /// off 1, noise cancellation 2, pass-through 3. The device rejects 0.
+    /// Hardware-verified on original Px8 (RPC software `0(20.0.2.0)`) and
+    /// Px7 S2 / Px7 S2e: off 1, noise cancellation 2, pass-through 3.
+    /// The devices reject 0 with device error 6.
     case originalPx8
     /// A generically advertised model whose values have not been confirmed on
     /// hardware. Noise control stays hidden and nothing is written.

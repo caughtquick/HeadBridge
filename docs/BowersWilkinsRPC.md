@@ -218,6 +218,12 @@ device error `0`.
 - The five-band EQ, EQ bypass, and spatial-audio reads return device error `1`,
   so those controls stay hidden.
 
+The Bowers & Wilkins Px7 S2e is hardware-validated. Discovery under `LE_BWHP`,
+automatic connection, and all three ANC modes (`1` = Off, `2` = Noise Cancellation,
+`3` = Pass-Through) were confirmed on physical hardware, returning device error `6`
+for wire mode `0` (matching the original Px8 profile). Two-band tone controls
+(`04:17` bass, `04:19` treble) with MessagePack signed integers were also confirmed.
+
 Recent PX/PI names are accepted as
 discovery candidates, but other models have not yet been verified. Their actual
 compatibility must be established by characteristic discovery, successful
