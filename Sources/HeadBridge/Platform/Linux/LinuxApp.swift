@@ -32,8 +32,19 @@ struct LinuxApp {
         }
         manager.refreshAll()
 
-        // Brief delay for PipeWire audio sink discovery
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        if subcommand != "disconnect",
+           let connectedDev = manager.recognizedDevices.first(where: { $0.isConnected }) {
+            if connectedDev.providerID == "bowers-wilkins" {
+                bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
+            }
+            for _ in 0..<8 {
+                if activeProvider(manager: manager)?.connectionState == .ready { break }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        } else {
+            // Brief delay for PipeWire audio sink discovery
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
 
         switch subcommand {
         case "status":
@@ -141,7 +152,8 @@ struct LinuxApp {
             print("Device:        \(provider.connectedName)")
             print("Vendor:        \(provider.vendorName)")
             print("State:         \(provider.connectionState.title)")
-            if let battery = provider.batteryPercent {
+            let battery = provider.batteryPercent ?? osConnectedDevice.flatMap { LinuxBluetoothInventory.shared.fetchBatteryPercentage(for: $0.address) }
+            if let battery = battery {
                 let charging = (provider.isCharging ?? false) ? " (Charging)" : ""
                 print("Battery:       \(battery)%\(charging)")
             } else {
