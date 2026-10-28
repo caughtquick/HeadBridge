@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import Charts
 import Combine
@@ -73,61 +74,6 @@ private enum SettingsDestination: Hashable {
     case device(String)
 }
 
-struct HeadphoneProviderSidebarSnapshot: Equatable {
-    let name: String
-    let vendor: String
-    let state: HeadphoneConnectionState
-    let battery: Int?
-
-    @MainActor
-    init(device: RecognizedHeadphoneDevice, provider: any HeadphoneProvider) {
-        name = device.name
-        vendor = device.vendorName
-
-        // Bowers & Wilkins identifies the device as "mac:<address>"; the
-        // paired-device inventory uses the bare address.
-        let activeID = provider.connectedDeviceID?.lowercased()
-        let pairedID = device.deviceID.lowercased()
-        let representsActiveDevice =
-            activeID == pairedID
-            || activeID == "mac:\(pairedID)"
-            || BluetoothDeviceNameMatcher.matches(provider.connectedName, device.name)
-        state = representsActiveDevice ? provider.connectionState : .idle
-        battery = state == .ready ? provider.batteryPercent : nil
-    }
-}
-
-/// A `List` retains rows by identity, so a row backed only by a provider
-/// existential does not directly participate in SwiftUI observation. Keep a
-/// row-local snapshot and subscribe to that exact provider instead of relying
-/// on a parent manager invalidation to rebuild retained rows.
-@MainActor
-final class HeadphoneProviderSidebarModel: ObservableObject {
-    let device: RecognizedHeadphoneDevice
-    let provider: any HeadphoneProvider
-    @Published private(set) var snapshot: HeadphoneProviderSidebarSnapshot
-
-    private var cancellable: AnyCancellable?
-
-    init(device: RecognizedHeadphoneDevice, provider: any HeadphoneProvider) {
-        self.device = device
-        self.provider = provider
-        snapshot = HeadphoneProviderSidebarSnapshot(device: device, provider: provider)
-        cancellable = provider.objectWillChange
-            // `objectWillChange` is emitted before @Published stores its new
-            // value. Read the provider on the next run-loop turn.
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                guard let self else { return }
-                let updated = HeadphoneProviderSidebarSnapshot(
-                    device: self.device,
-                    provider: self.provider
-                )
-                guard updated != self.snapshot else { return }
-                self.snapshot = updated
-            }
-    }
-}
 
 private struct HeadphoneDeviceSidebarRow: View {
     @StateObject private var model: HeadphoneProviderSidebarModel
@@ -1724,3 +1670,5 @@ private struct ProtocolTransportLogView: View {
         try handle.close()
     }
 }
+#endif
+

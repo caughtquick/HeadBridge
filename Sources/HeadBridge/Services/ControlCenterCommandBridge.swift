@@ -1,3 +1,4 @@
+#if os(macOS)
 import Combine
 import Foundation
 import WidgetKit
@@ -97,3 +98,5 @@ final class ControlCenterCommandBridge: NSObject {
         Self.reload(kind: HeadBridgeControlConstants.noiseControlKind)
     }
 }
+#endif
+

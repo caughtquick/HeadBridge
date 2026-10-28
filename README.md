@@ -71,6 +71,34 @@ HeadBridge has no Dock icon. Open its headphones icon in the menu bar, then choo
 
 Use **HeadBridge Settings… → Check for Updates…** for in-app updates, or run the install command again. Sparkle verifies update archives using the public key embedded in the app; this update signature is separate from Apple Developer ID signing and notarization.
 
+## Linux Support
+
+HeadBridge provides a dedicated CLI and background daemon for Linux (`headbridge`), supporting Bowers & Wilkins RPC and Sony MDR V1 devices using BlueZ and PipeWire.
+
+### Building & Running on Linux
+
+```shell
+swift build -c release
+./.build/release/headbridge status
+```
+
+### CLI Quick Reference
+
+```shell
+headbridge status                 # Show status of connected headphones
+headbridge status --json          # JSON output for Waybar, Polybar, or scripts
+headbridge devices                # List recognized paired Bluetooth devices
+headbridge connect [address]      # Connect to headphones
+headbridge disconnect             # Disconnect active session
+headbridge anc [off|anc|ambient]  # Get or set Active Noise Cancellation mode
+headbridge ambient-level [0-20]   # Get or set Sony ambient level
+headbridge eq [bass <n>] [treble <n>] # Get or set EQ tone controls (-60 to +60)
+headbridge volume [get|set <0-100>]   # Control PipeWire audio sink volume
+headbridge daemon                 # Run background connection & volume sync daemon
+```
+
+For complete Linux documentation including systemd services and Waybar integration, see [`docs/LINUX.md`](docs/LINUX.md).
+
 ## Compatibility
 
 | Provider family | Hardware validation | Status |

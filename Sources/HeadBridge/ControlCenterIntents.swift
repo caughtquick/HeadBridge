@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppIntents
 import Foundation
 
@@ -105,3 +106,5 @@ struct SetStickyInputControlIntent: SetValueIntent {
         return .result()
     }
 }
+#endif
+
