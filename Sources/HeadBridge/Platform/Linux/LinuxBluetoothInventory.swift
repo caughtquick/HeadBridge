@@ -2,64 +2,61 @@ import Foundation
 
 public final class LinuxBluetoothInventory: BluetoothInventoryService, @unchecked Sendable {
     public static let shared = LinuxBluetoothInventory()
+    private let runner: LinuxCommandRunner
 
-    public init() {}
+    public init(runner: LinuxCommandRunner = .shared) {
+        self.runner = runner
+    }
 
     public static func fetchPairedDevices() -> [BluetoothPairedDevice]? {
         shared.fetchPairedDevices()
     }
 
     public func fetchPairedDevices() -> [BluetoothPairedDevice]? {
-        // Try bluetoothctl directly or via dev container helper
-        if let devices = fetchViaBluetoothctl() {
-            return devices
-        }
-        return nil
+        fetchViaBluetoothctl()
     }
 
-    private func findExecutable(_ name: String) -> String? {
-        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin")
-            .split(separator: ":")
-        for dir in paths {
-            let fullPath = "\(dir)/\(name)"
-            if FileManager.default.isExecutableFile(atPath: fullPath) {
-                return fullPath
-            }
+    public func fetchBatteryPercentage(for address: String) -> Int? {
+        let macSegment = address.replacingOccurrences(of: ":", with: "_").uppercased()
+        let path = "/org/bluez/hci0/dev_\(macSegment)"
+        guard let result = runner.run("busctl", arguments: ["get-property", "org.bluez", path, "org.bluez.Battery1", "Percentage"]),
+              result.exitCode == 0 else {
+            return nil
+        }
+        // Output format: "y 61"
+        let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.split(separator: " ")
+        if parts.count >= 2, let percent = Int(parts[1]) {
+            return percent
         }
         return nil
-    }
-
-    private func runCommand(_ executable: String, arguments: [String]) -> String? {
-        let process = Process()
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        if findExecutable(executable) != nil {
-            process.executableURL = URL(fileURLWithPath: findExecutable(executable)!)
-            process.arguments = arguments
-        } else if let hostExec = findExecutable("distrobox-host-exec") {
-            process.executableURL = URL(fileURLWithPath: hostExec)
-            process.arguments = [executable] + arguments
-        } else {
-            return nil
-        }
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)
-        } catch {
-            return nil
-        }
     }
 
     private func fetchViaBluetoothctl() -> [BluetoothPairedDevice]? {
-        guard let output = runCommand("bluetoothctl", arguments: ["devices"]) else {
-            return nil
+        // 1. Get currently connected device addresses in one fast query (~30ms)
+        var connectedAddresses = Set<String>()
+        if let connResult = runner.run("bluetoothctl", arguments: ["devices", "Connected"]),
+           connResult.exitCode == 0 {
+            for line in connResult.stdout.split(separator: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard trimmed.hasPrefix("Device ") else { continue }
+                let parts = trimmed.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+                guard parts.count >= 2 else { continue }
+                connectedAddresses.insert(String(parts[1]).uppercased())
+            }
         }
+
+        // 2. Get paired devices (fast ~30ms; fallback to general devices query if Paired is not supported)
+        var pairedOutput: String?
+        if let pairedResult = runner.run("bluetoothctl", arguments: ["devices", "Paired"]),
+           pairedResult.exitCode == 0, !pairedResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pairedOutput = pairedResult.stdout
+        } else if let devResult = runner.run("bluetoothctl", arguments: ["devices"]),
+                  devResult.exitCode == 0 {
+            pairedOutput = devResult.stdout
+        }
+
+        guard let output = pairedOutput else { return nil }
 
         var results: [BluetoothPairedDevice] = []
         let lines = output.split(separator: "\n")
@@ -73,16 +70,7 @@ public final class LinuxBluetoothInventory: BluetoothInventoryService, @unchecke
             let address = String(parts[1]).uppercased()
             let name = parts.count >= 3 ? String(parts[2]) : address
 
-            var isConnected = false
-            if let infoOutput = runCommand("bluetoothctl", arguments: ["info", address]) {
-                for infoLine in infoOutput.split(separator: "\n") {
-                    let infoTrimmed = infoLine.trimmingCharacters(in: .whitespaces)
-                    if infoTrimmed.hasPrefix("Connected:") {
-                        isConnected = infoTrimmed.lowercased().contains("yes")
-                    }
-                }
-            }
-
+            let isConnected = connectedAddresses.contains(address)
             results.append(
                 BluetoothPairedDevice(
                     id: address,

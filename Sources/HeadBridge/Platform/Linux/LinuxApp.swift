@@ -25,10 +25,15 @@ struct LinuxApp {
 
         let manager = HeadphoneManager(providers: [bwProvider, sonyProvider])
         manager.installAudioDeviceDiscovery(systemAudio: audio)
+
+        // Populate paired devices synchronously
+        if let paired = LinuxBluetoothInventory.fetchPairedDevices() {
+            manager.applyBluetoothPairedDevices(paired)
+        }
         manager.refreshAll()
 
-        // Wait brief moment for initial discovery
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        // Brief delay for PipeWire audio sink discovery
+        try? await Task.sleep(nanoseconds: 100_000_000)
 
         switch subcommand {
         case "status":
@@ -88,19 +93,26 @@ struct LinuxApp {
     private static func handleStatus(manager: HeadphoneManager, audio: LinuxPipeWireAudio, isJSON: Bool) {
         let provider = activeProvider(manager: manager)
         let isConnected = provider?.connectionState == .ready
+        let osConnectedDevice = manager.recognizedDevices.first(where: { $0.isConnected })
 
         if isJSON {
+            let activeDevName = provider?.connectedName.isEmpty == false ? provider?.connectedName : osConnectedDevice?.name
+            let activeVendor = provider != nil ? provider?.vendorName : osConnectedDevice?.vendorName
+            let activeProviderID = provider != nil ? provider?.providerID : osConnectedDevice?.providerID
+            let battery = provider?.batteryPercent ?? (osConnectedDevice.flatMap { LinuxBluetoothInventory.shared.fetchBatteryPercentage(for: $0.address) })
+
             var dict: [String: Any] = [
-                "connected": isConnected,
-                "connectionState": (provider?.connectionState.title) ?? "idle",
-                "deviceName": provider?.connectedName ?? "",
-                "vendor": provider?.vendorName ?? "",
-                "providerID": provider?.providerID ?? "",
-                "batteryPercent": provider?.batteryPercent as Any,
+                "connected": isConnected || osConnectedDevice != nil,
+                "connectionState": isConnected ? ((provider?.connectionState.title) ?? "ready") : (osConnectedDevice != nil ? "connected" : "idle"),
+                "deviceName": activeDevName ?? "",
+                "vendor": activeVendor ?? "",
+                "providerID": activeProviderID ?? "",
+                "batteryPercent": battery as Any,
                 "isCharging": provider?.isCharging as Any,
                 "noiseMode": provider?.noiseMode?.rawValue as Any,
                 "volume": audio.volume,
-                "audioSink": audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? ""
+                "audioSink": audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "",
+                "vendorRPCReady": isConnected
             ]
             if let bw = provider as? BowersWilkinsProvider {
                 dict["bassLevel"] = bw.bassLevel
@@ -134,6 +146,19 @@ struct LinuxApp {
             let sinkName = audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "Default"
             let volPercent = Int((audio.volume * 100).rounded())
             print("Audio Output:  \(sinkName) (Volume: \(volPercent)%)")
+        } else if let osDev = osConnectedDevice {
+            print("Device:        \(osDev.name) (\(osDev.address))")
+            print("Vendor:        \(osDev.vendorName)")
+            print("State:         Connected (Audio / BlueZ)")
+            if let battery = LinuxBluetoothInventory.shared.fetchBatteryPercentage(for: osDev.address) {
+                print("Battery:       \(battery)%")
+            } else {
+                print("Battery:       Unknown")
+            }
+            let sinkName = audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "Default"
+            let volPercent = Int((audio.volume * 100).rounded())
+            print("Audio Output:  \(sinkName) (Volume: \(volPercent)%)")
+            print("Vendor RPC:    Disconnected (BLE GATT required for ANC/EQ controls)")
         } else {
             print("No supported headphones currently connected.")
             let paired = manager.recognizedDevices
@@ -375,19 +400,23 @@ struct LinuxApp {
     }
 
     private static func handleBattery(manager: HeadphoneManager, isJSON: Bool) {
-        guard let provider = activeProvider(manager: manager) else {
+        let provider = activeProvider(manager: manager)
+        let osConnectedDevice = manager.recognizedDevices.first(where: { $0.isConnected })
+
+        guard provider != nil || osConnectedDevice != nil else {
             if isJSON { printJSON(["error": "No headphone connected"]) }
             else { print("No headphone connected.") }
             return
         }
 
-        let percent = provider.batteryPercent
-        let isCharging = provider.isCharging ?? false
+        let name = (provider?.connectedName.isEmpty == false ? provider?.connectedName : osConnectedDevice?.name) ?? "Headphones"
+        let percent = provider?.batteryPercent ?? (osConnectedDevice.flatMap { LinuxBluetoothInventory.shared.fetchBatteryPercentage(for: $0.address) })
+        let isCharging = provider?.isCharging ?? false
 
         if isJSON {
-            printJSON(["device": provider.connectedName, "batteryPercent": percent as Any, "isCharging": isCharging])
+            printJSON(["device": name, "batteryPercent": percent as Any, "isCharging": isCharging])
         } else {
-            print("Device:        \(provider.connectedName)")
+            print("Device:        \(name)")
             print("Battery:       \(percent.map { "\($0)%" } ?? "Unknown")")
             print("Charging:      \(isCharging ? "Yes" : "No")")
         }

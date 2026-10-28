@@ -184,7 +184,7 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
                 self.inventoryQuery = nil
                 self.isRefreshingDevices = false
                 if let discovered {
-                    self.devices = discovered
+                    self.devices = discovered.filter { Self.isSupportedHeadphoneName($0.name) }
                 }
                 self.connectToMatchingAudioDeviceIfNeeded()
 
@@ -204,7 +204,7 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
                 else { return }
                 self.isRefreshingDevices = false
                 if let discovered {
-                    self.devices = discovered
+                    self.devices = discovered.filter { Self.isSupportedHeadphoneName($0.name) }
                 }
                 self.connectToMatchingAudioDeviceIfNeeded()
 
@@ -373,6 +373,7 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
         coreAudioDeviceNames: [String]
     ) -> BluetoothPairedDevice? {
         devices.first { candidate in
+            guard Self.isSupportedHeadphoneName(candidate.name) else { return false }
             guard candidate.isAudioConnected else { return false }
             return coreAudioDeviceNames.isEmpty
                 || coreAudioDeviceNames.contains {

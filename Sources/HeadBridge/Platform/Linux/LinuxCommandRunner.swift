@@ -44,13 +44,33 @@ public final class LinuxCommandRunner: @unchecked Sendable {
             return nil
         }
 
+        final class DataBox: @unchecked Sendable {
+            var data = Data()
+        }
+
+        let outBox = DataBox()
+        let errBox = DataBox()
+        let group = DispatchGroup()
+
         do {
             try process.run()
+
+            group.enter()
+            DispatchQueue.global().async {
+                outBox.data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+
+            group.enter()
+            DispatchQueue.global().async {
+                errBox.data = errPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+
             process.waitUntilExit()
-            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let stdout = String(data: outData, encoding: .utf8) ?? ""
-            let stderr = String(data: errData, encoding: .utf8) ?? ""
+            group.wait()
+            let stdout = String(data: outBox.data, encoding: .utf8) ?? ""
+            let stderr = String(data: errBox.data, encoding: .utf8) ?? ""
             return CommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
         } catch {
             return nil
