@@ -64,13 +64,49 @@ HeadBridge follows a clean layered architecture separating protocol codecs and p
 
 ---
 
-## Building
+## Building & Installation
+
+### Quick Install (One-Liner)
+Run the automated installation script, which compiles the release binary, installs it to `~/.local/bin/headbridge`, and enables the user systemd service:
 
 ```bash
-swift build -c release
+./Scripts/install-linux.sh
 ```
 
-The resulting binary will be placed at `.build/release/headbridge`.
+### Manual Installation
+
+1. **Build release binary:**
+   ```bash
+   swift build -c release
+   ```
+
+2. **Install to user PATH:**
+   ```bash
+   mkdir -p ~/.local/bin
+   install -m 755 .build/release/headbridge ~/.local/bin/headbridge
+   ```
+   *(Or system-wide: `sudo install -m 755 .build/release/headbridge /usr/local/bin/headbridge`)*
+
+3. **Enable systemd user daemon (recommended):**
+   ```bash
+   mkdir -p ~/.config/systemd/user
+   cat > ~/.config/systemd/user/headbridge.service <<EOF
+   [Unit]
+   Description=HeadBridge Bluetooth Headphone Daemon
+   After=bluetooth.target pipewire.service wireplumber.service
+
+   [Service]
+   ExecStart=%h/.local/bin/headbridge daemon
+   Restart=on-failure
+   RestartSec=3
+
+   [Install]
+   WantedBy=default.target
+   EOF
+
+   systemctl --user daemon-reload
+   systemctl --user enable --now headbridge.service
+   ```
 
 ---
 
@@ -182,9 +218,9 @@ Description=HeadBridge Bluetooth Headphone Daemon
 After=bluetooth.target pipewire.service wireplumber.service
 
 [Service]
-ExecStart=/usr/local/bin/headbridge daemon
+ExecStart=%h/.local/bin/headbridge daemon
 Restart=on-failure
-RestartSec=5
+RestartSec=3
 
 [Install]
 WantedBy=default.target
