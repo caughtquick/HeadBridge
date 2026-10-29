@@ -416,9 +416,9 @@ struct LinuxApp {
     }
 
     private static func executeANC(modeArg: String?, manager: HeadphoneManager, isJSON: Bool) async -> (output: String, exitCode: Int32) {
-        guard let provider = activeProvider(manager: manager) else {
-            if isJSON { return (jsonString(for: ["error": "No headphone connected"]), 1) }
-            else { return ("Error: No headphone connected.\n", 1) }
+        guard let provider = activeProvider(manager: manager), provider.connectionState == .ready else {
+            if isJSON { return (jsonString(for: ["error": "No headphone connected or session not ready"]), 1) }
+            else { return ("Error: No headphone connected or session not ready.\n", 1) }
         }
 
         guard let modeArg = modeArg else {
@@ -448,6 +448,12 @@ struct LinuxApp {
 
         guard let mode = targetMode else {
             return ("Invalid ANC mode: \(modeArg). Available: off, anc, ambient, wind\n", 1)
+        }
+
+        guard provider.supportedNoiseModes.contains(mode) else {
+            let supported = provider.supportedNoiseModes.map(noiseModeDescription).joined(separator: ", ")
+            let err = "Mode '\(modeArg)' is not supported by this device. Supported: \(supported)\n"
+            return isJSON ? (jsonString(for: ["error": err.trimmingCharacters(in: .whitespacesAndNewlines)]), 1) : (err, 1)
         }
 
         provider.setNoiseMode(mode)

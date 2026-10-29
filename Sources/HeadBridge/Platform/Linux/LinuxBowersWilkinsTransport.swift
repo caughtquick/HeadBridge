@@ -151,9 +151,9 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
             return nil
         }
 
-        let requestUUIDs = Set(BWRPC.requestUUIDs.map { $0.lowercased() })
-        let responseUUIDs = Set(BWRPC.responseUUIDs.map { $0.lowercased() })
-        let notificationUUIDs = Set(BWRPC.notificationUUIDs.map { $0.lowercased() })
+        let reqUUID = BWRPC.requestUUID.lowercased()
+        let respUUID = BWRPC.responseUUID.lowercased()
+        let notifUUID = BWRPC.notificationUUID.lowercased()
 
         var req: String?
         var resp: String?
@@ -170,9 +170,9 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
                     continue
                 }
 
-                if requestUUIDs.contains(uuid) { req = path }
-                else if responseUUIDs.contains(uuid) { resp = path }
-                else if notificationUUIDs.contains(uuid) { notif = path }
+                if uuid == reqUUID { req = path }
+                else if uuid == respUUID { resp = path }
+                else if uuid == notifUUID { notif = path }
             }
         }
 
@@ -186,9 +186,9 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
                     continue
                 }
 
-                if requestUUIDs.contains(uuid) { req = path }
-                else if responseUUIDs.contains(uuid) { resp = path }
-                else if notificationUUIDs.contains(uuid) { notif = path }
+                if uuid == reqUUID { req = path }
+                else if uuid == respUUID { resp = path }
+                else if uuid == notifUUID { notif = path }
             }
         }
 
@@ -273,22 +273,22 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
     try:
         bus.call_sync('org.bluez', resp_path, 'org.bluez.GattCharacteristic1', 'StartNotify', None, None, Gio.DBusCallFlags.NONE, 2000, None)
     except Exception as e:
-        sys.stderr.write(f"StartNotify resp error: {e}\\n")
-        sys.stderr.flush()
+        print(f"ERR StartNotify resp error: {e}")
+        sys.stdout.flush()
 
     if notif_path != 'none':
         try:
             bus.call_sync('org.bluez', notif_path, 'org.bluez.GattCharacteristic1', 'StartNotify', None, None, Gio.DBusCallFlags.NONE, 2000, None)
         except Exception as e:
-            sys.stderr.write(f"StartNotify notif error: {e}\\n")
-            sys.stderr.flush()
+            print(f"ERR StartNotify notif error: {e}")
+            sys.stdout.flush()
 
     def do_write(payload):
         try:
             bus.call_sync('org.bluez', req_path, 'org.bluez.GattCharacteristic1', 'WriteValue', payload, None, Gio.DBusCallFlags.NONE, 2000, None)
         except Exception as e:
-            sys.stderr.write(f"WriteValue error: {e}\\n")
-            sys.stderr.flush()
+            print(f"ERR WriteValue error: {e}")
+            sys.stdout.flush()
         return False
 
     def stdin_worker():
@@ -301,8 +301,8 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
                     payload = GLib.Variant('(aya{sv})', (list(raw), {}))
                     GLib.idle_add(do_write, payload)
                 except Exception as e:
-                    sys.stderr.write(f"Write parse error: {e}\\n")
-                    sys.stderr.flush()
+                    print(f"ERR Write parse error: {e}")
+                    sys.stdout.flush()
             elif line == 'QUIT':
                 break
         GLib.idle_add(loop.quit)
@@ -353,6 +353,8 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
                         self.onLog?(.incoming, "BWRPC notification: \(data.map { String(format: "%02X", $0) }.joined(separator: " "))")
                         self.onNotificationData?(data)
                     }
+                } else if line.hasPrefix("ERR ") {
+                    self.onLog?(.incoming, "GATT bridge error: \(line.dropFirst(4))")
                 }
             }
         }
