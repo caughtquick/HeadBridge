@@ -1,44 +1,36 @@
 #!/bin/bash
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${HOME}/.local"
 BIN_DIR="${PREFIX}/bin"
-SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
-SERVICE_FILE="${SYSTEMD_USER_DIR}/headbridge.service"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+RELEASE_BIN="${REPO_DIR}/.build/release/headbridge"
+REPO_SERVICE="${REPO_DIR}/systemd/headbridge.service"
 
-echo "==> Building HeadBridge release binary..."
-swift build -c release
+echo "==> Building HeadBridge release binary in ${REPO_DIR}..."
+(cd "${REPO_DIR}" && swift build -c release)
 
-echo "==> Installing binary to ${BIN_DIR}/headbridge..."
+echo "==> Creating directories..."
 mkdir -p "${BIN_DIR}"
-install -m 755 .build/release/headbridge "${BIN_DIR}/headbridge"
-
-echo "==> Setting up systemd user service..."
 mkdir -p "${SYSTEMD_USER_DIR}"
-cat > "${SERVICE_FILE}" <<EOF
-[Unit]
-Description=HeadBridge Bluetooth Headphone Daemon
-After=bluetooth.target pipewire.service wireplumber.service
 
-[Service]
-ExecStart=%h/.local/bin/headbridge daemon
-Restart=on-failure
-RestartSec=3
+echo "==> Symlinking binary to ${BIN_DIR}/headbridge..."
+ln -sf "${RELEASE_BIN}" "${BIN_DIR}/headbridge"
 
-[Install]
-WantedBy=default.target
-EOF
+echo "==> Symlinking systemd user service to ${SYSTEMD_USER_DIR}/headbridge.service..."
+ln -sf "${REPO_SERVICE}" "${SYSTEMD_USER_DIR}/headbridge.service"
 
 echo "==> Reloading and enabling systemd user service..."
 systemctl --user daemon-reload
 systemctl --user enable --now headbridge.service
 
 echo ""
-echo "HeadBridge installed and service started successfully!"
-echo "Binary:  ${BIN_DIR}/headbridge"
-echo "Service: headbridge.service"
+echo "HeadBridge installed via symlinks and service started successfully!"
+echo "Binary symlink:  ${BIN_DIR}/headbridge -> ${RELEASE_BIN}"
+echo "Service symlink: ${SYSTEMD_USER_DIR}/headbridge.service -> ${REPO_SERVICE}"
 echo ""
 echo "Try running:"
 echo "  headbridge status"
 echo "  headbridge anc"
-echo "  headbridge eq"
+echo "  headbridge devices"

@@ -28,10 +28,6 @@ public enum BatteryDisplayMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-#if os(macOS)
-import ServiceManagement
-#endif
-
 @MainActor
 final class AppSettings: ObservableObject {
     private enum Key {
@@ -40,7 +36,6 @@ final class AppSettings: ObservableObject {
         static let volumeSyncPrefix = "VolumeSyncEnabled"
         static let developerMode = "DeveloperModeEnabled"
         static let showsDockIconWithSettings = "ShowsDockIconWithSettings"
-        static let launchAtLoginRequested = "LaunchAtLoginRequested"
 
         static func volumeSync(providerID: String) -> String {
             "\(volumeSyncPrefix).\(providerID)"
@@ -57,21 +52,11 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(developerModeEnabled, forKey: Key.developerMode) }
     }
 
-    /// HeadBridge is a menu-bar app; this adds a Dock icon (and a Command-Tab
-    /// entry) only while its settings window is open.
     @Published var showsDockIconWithSettings: Bool {
         didSet { defaults.set(showsDockIconWithSettings, forKey: Key.showsDockIconWithSettings) }
     }
 
-    @Published private(set) var launchAtLoginEnabled = false
-    @Published private(set) var launchAtLoginRequiresApproval = false
-    @Published private(set) var launchAtLoginError: String?
-
     private let defaults: UserDefaults
-    private let launchAtLoginLogger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "io.github.herenickname.HeadBridge",
-        category: "LaunchAtLogin"
-    )
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -80,16 +65,6 @@ final class AppSettings: ObservableObject {
             .flatMap(BatteryDisplayMode.init(rawValue:)) ?? .always
         developerModeEnabled = defaults.bool(forKey: Key.developerMode)
         showsDockIconWithSettings = defaults.bool(forKey: Key.showsDockIconWithSettings)
-
-        #if os(macOS)
-        let status = SMAppService.mainApp.status
-        if defaults.object(forKey: Key.launchAtLoginRequested) == nil,
-            status == .enabled || status == .requiresApproval
-        {
-            defaults.set(true, forKey: Key.launchAtLoginRequested)
-        }
-        reconcileLaunchAtLoginRegistration()
-        #endif
     }
 
     func registerVolumeSynchronization(
@@ -129,61 +104,4 @@ final class AppSettings: ObservableObject {
             .removeDuplicates()
             .eraseToAnyPublisher()
     }
-
-    #if os(macOS)
-    func setLaunchAtLoginEnabled(_ enabled: Bool) {
-        defaults.set(enabled, forKey: Key.launchAtLoginRequested)
-        reconcileLaunchAtLoginRegistration()
-    }
-
-    private func reconcileLaunchAtLoginRegistration() {
-        launchAtLoginError = nil
-        let requested = defaults.bool(forKey: Key.launchAtLoginRequested)
-        do {
-            if requested {
-                switch SMAppService.mainApp.status {
-                case .notRegistered, .notFound:
-                    try SMAppService.mainApp.register()
-                    launchAtLoginLogger.info("Registered the main app as a login item")
-                case .enabled, .requiresApproval:
-                    break
-                @unknown default:
-                    break
-                }
-            } else if SMAppService.mainApp.status != .notRegistered,
-                SMAppService.mainApp.status != .notFound
-            {
-                try SMAppService.mainApp.unregister()
-                launchAtLoginLogger.info("Unregistered the main app login item")
-            }
-        } catch {
-            launchAtLoginError = error.localizedDescription
-            launchAtLoginLogger.error(
-                "Could not update login-item registration: \(error.localizedDescription, privacy: .public)")
-        }
-        refreshLaunchAtLoginStatus()
-    }
-
-    func refreshLaunchAtLoginStatus() {
-        switch SMAppService.mainApp.status {
-        case .enabled:
-            launchAtLoginEnabled = true
-            launchAtLoginRequiresApproval = false
-        case .requiresApproval:
-            launchAtLoginEnabled = true
-            launchAtLoginRequiresApproval = true
-        case .notRegistered, .notFound:
-            launchAtLoginEnabled = false
-            launchAtLoginRequiresApproval = false
-        @unknown default:
-            launchAtLoginEnabled = false
-            launchAtLoginRequiresApproval = false
-        }
-    }
-
-    func openLoginItemsSettings() {
-        SMAppService.openSystemSettingsLoginItems()
-    }
-    #endif
 }
-

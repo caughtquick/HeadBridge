@@ -99,37 +99,7 @@ final class RPCCodecTests: XCTestCase {
         )
     }
 
-    func testBluetoothInventoryDecodesPairedAndConnectedDevicesWithoutDuplicates() throws {
-        let json = #"""
-            {
-              "SPBluetoothDataType": [{
-                "device_connected": [
-                  {"Px7 S3": {
-                    "device_address": "AA:BB:CC:DD:EE:FF",
-                    "device_services": "0x800019 < HFP AVRCP A2DP ACL >"
-                  }},
-                  {"PX7 S3": {
-                    "device_address": "77:88:99:AA:BB:CC",
-                    "device_services": "0x400000 < BLE >"
-                  }}
-                ],
-                "device_not_connected": [
-                  {"Px7 S3": {"device_address": "AA:BB:CC:DD:EE:FF"}},
-                  {"WH-1000XM3": {"device_address": "11:22:33:44:55:66"}}
-                ]
-              }]
-            }
-            """#
 
-        let devices = try XCTUnwrap(BluetoothDeviceInventory.decode(Data(json.utf8)))
-
-        XCTAssertEqual(devices.count, 2)
-        XCTAssertEqual(devices.first(where: { $0.id == "aa:bb:cc:dd:ee:ff" })?.name, "Px7 S3")
-        XCTAssertEqual(devices.first(where: { $0.id == "aa:bb:cc:dd:ee:ff" })?.isConnected, true)
-        XCTAssertEqual(devices.first(where: { $0.id == "aa:bb:cc:dd:ee:ff" })?.isAudioConnected, true)
-        XCTAssertNil(devices.first(where: { $0.id == "77:88:99:aa:bb:cc" }))
-        XCTAssertEqual(devices.first(where: { $0.id == "11:22:33:44:55:66" })?.isConnected, false)
-    }
 
     func testSonyAutomaticConnectionUsesBluetoothAudioWithoutWaitingForCoreAudio() {
         let sony = BluetoothPairedDevice(

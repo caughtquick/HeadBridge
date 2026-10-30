@@ -78,7 +78,15 @@ struct LinuxApp {
         let sonyClient = SonyV1Client(transport: sonyTransport)
         let sonyProvider = SonyMDRProvider(client: sonyClient)
 
-        let manager = HeadphoneManager(providers: [bwProvider, sonyProvider])
+        let appleTransport = LinuxAppleAccessoryTransport()
+        let appleProvider = AppleAccessoryProvider(transport: appleTransport)
+        if isVerbose {
+            appleTransport.onLog = { dir, msg in
+                fputs("[\(dir == .outgoing ? "OUT" : "IN")] [Apple] \(msg)\n", stderr)
+            }
+        }
+
+        let manager = HeadphoneManager(providers: [bwProvider, sonyProvider, appleProvider])
         manager.installAudioDeviceDiscovery(systemAudio: audio)
         manager.updateAudioConnectedDevices(audio.devices)
 
@@ -95,7 +103,9 @@ struct LinuxApp {
                 audio: audio,
                 bwTransport: bwTransport,
                 bwProvider: bwProvider,
-                sonyProvider: sonyProvider
+                sonyProvider: sonyProvider,
+                appleTransport: appleTransport,
+                appleProvider: appleProvider
             )
             return
         }
@@ -107,7 +117,9 @@ struct LinuxApp {
             audio: audio,
             bwTransport: bwTransport,
             bwProvider: bwProvider,
-            sonyProvider: sonyProvider
+            sonyProvider: sonyProvider,
+            appleTransport: appleTransport,
+            appleProvider: appleProvider
         )
 
         if !response.output.isEmpty {
@@ -128,7 +140,9 @@ struct LinuxApp {
         audio: LinuxPipeWireAudio,
         bwTransport: LinuxBowersWilkinsTransport,
         bwProvider: BowersWilkinsProvider,
-        sonyProvider: SonyMDRProvider
+        sonyProvider: SonyMDRProvider,
+        appleTransport: LinuxAppleAccessoryTransport,
+        appleProvider: AppleAccessoryProvider
     ) async -> LinuxIPCResponse {
         let filteredArgs = args.filter { $0 != "--json" && $0 != "--verbose" && $0 != "-v" }
         let subcommand = filteredArgs.first ?? "status"
@@ -142,6 +156,8 @@ struct LinuxApp {
                 bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
             } else if connectedDev.providerID == "sony" && sonyProvider.connectionState == .idle {
                 sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
+            } else if connectedDev.providerID == "apple" && appleProvider.connectionState == .idle {
+                appleTransport.connect(address: connectedDev.address, name: connectedDev.name)
             }
             for _ in 0..<15 {
                 if activeProvider(manager: manager)?.connectionState == .ready { break }
@@ -174,7 +190,7 @@ struct LinuxApp {
 
         case "connect":
             let target = filteredArgs.count > 1 ? filteredArgs[1] : nil
-            let res = await executeConnect(target: target, manager: manager, bwTransport: bwTransport, isJSON: isJSON)
+            let res = await executeConnect(target: target, manager: manager, bwTransport: bwTransport, appleTransport: appleTransport, isJSON: isJSON)
             return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "disconnect":
@@ -259,6 +275,13 @@ struct LinuxApp {
                 dict["trebleLevel"] = bw.trebleLevel
             } else if let sony = provider as? SonyMDRProvider {
                 dict["ambientLevel"] = sony.ambientLevel
+            } else if let apple = provider as? AppleAccessoryProvider {
+                dict["leftBattery"] = apple.leftBattery?.level
+                dict["rightBattery"] = apple.rightBattery?.level
+                dict["caseBattery"] = apple.caseBattery?.level
+                dict["conversationAwareness"] = apple.conversationAwarenessEnabled
+                dict["earDetection"] = apple.earDetectionEnabled
+                dict["appleModel"] = apple.appleModel.displayName
             }
             return (jsonString(for: dict), 0)
         }
@@ -283,6 +306,23 @@ struct LinuxApp {
                 lines.append("Tone / EQ:     Bass: \(bw.bassLevel), Treble: \(bw.trebleLevel)")
             } else if let sony = provider as? SonyMDRProvider {
                 lines.append("Ambient Level: \(sony.ambientLevel)/20")
+            } else if let apple = provider as? AppleAccessoryProvider {
+                var podParts: [String] = []
+                if let l = apple.leftBattery, l.status != .disconnected {
+                    podParts.append("L: \(l.level)%\(l.status == .charging ? " ⚡" : "")")
+                }
+                if let r = apple.rightBattery, r.status != .disconnected {
+                    podParts.append("R: \(r.level)%\(r.status == .charging ? " ⚡" : "")")
+                }
+                if let c = apple.caseBattery, c.status != .disconnected {
+                    podParts.append("Case: \(c.level)%\(c.status == .charging ? " ⚡" : "")")
+                }
+                if !podParts.isEmpty {
+                    lines.append("Pods / Case:   \(podParts.joined(separator: "  |  "))")
+                }
+                if let ca = apple.conversationAwarenessEnabled {
+                    lines.append("Conv. Aware:   \(ca ? "On" : "Off")")
+                }
             }
             let sinkName = audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "Default"
             lines.append("Audio Output:  \(sinkName)")
@@ -334,7 +374,7 @@ struct LinuxApp {
         var lines: [String] = []
         lines.append("=== Recognized Bluetooth Devices ===")
         if paired.isEmpty {
-            lines.append("No supported Bowers & Wilkins or Sony headphones detected.")
+            lines.append("No supported AirPods, Beats, Bowers & Wilkins, or Sony headphones detected.")
             lines.append("Ensure headphones are paired via bluetoothctl or your desktop settings.")
         } else {
             for dev in paired {
@@ -345,7 +385,7 @@ struct LinuxApp {
         return (lines.joined(separator: "\n") + "\n", 0)
     }
 
-    private static func executeConnect(target: String?, manager: HeadphoneManager, bwTransport: LinuxBowersWilkinsTransport, isJSON: Bool) async -> (output: String, exitCode: Int32) {
+    private static func executeConnect(target: String?, manager: HeadphoneManager, bwTransport: LinuxBowersWilkinsTransport, appleTransport: LinuxAppleAccessoryTransport, isJSON: Bool) async -> (output: String, exitCode: Int32) {
         let paired = manager.recognizedDevices
         guard !paired.isEmpty else {
             if isJSON {
@@ -374,6 +414,8 @@ struct LinuxApp {
 
         if device.providerID == "bowers-wilkins" {
             bwTransport.connect(address: device.address, name: device.name)
+        } else if device.providerID == "apple" {
+            appleTransport.connect(address: device.address, name: device.name)
         }
 
         for _ in 0..<8 {
@@ -442,12 +484,14 @@ struct LinuxApp {
             targetMode = .ambient
         case "wind", "wind-reduction":
             targetMode = .windReduction
+        case "adaptive":
+            targetMode = .adaptive
         default:
             targetMode = nil
         }
 
         guard let mode = targetMode else {
-            return ("Invalid ANC mode: \(modeArg). Available: off, anc, ambient, wind\n", 1)
+            return ("Invalid ANC mode: \(modeArg). Available: off, anc, ambient, adaptive, wind\n", 1)
         }
 
         guard provider.supportedNoiseModes.contains(mode) else {
@@ -631,7 +675,9 @@ struct LinuxApp {
         audio: LinuxPipeWireAudio,
         bwTransport: LinuxBowersWilkinsTransport,
         bwProvider: BowersWilkinsProvider,
-        sonyProvider: SonyMDRProvider
+        sonyProvider: SonyMDRProvider,
+        appleTransport: LinuxAppleAccessoryTransport,
+        appleProvider: AppleAccessoryProvider
     ) async {
         print("Starting HeadBridge daemon on Linux...")
         let server = LinuxDaemonServer()
@@ -666,7 +712,9 @@ struct LinuxApp {
                 audio: audio,
                 bwTransport: bwTransport,
                 bwProvider: bwProvider,
-                sonyProvider: sonyProvider
+                sonyProvider: sonyProvider,
+                appleTransport: appleTransport,
+                appleProvider: appleProvider
             )
         }
 
@@ -682,6 +730,8 @@ struct LinuxApp {
                     bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
                 } else if connectedDev.providerID == "sony" {
                     sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
+                } else if connectedDev.providerID == "apple" {
+                    appleTransport.connect(address: connectedDev.address, name: connectedDev.name)
                 }
                 for _ in 0..<30 {
                     if activeProvider(manager: manager)?.connectionState == .ready { break }
@@ -708,6 +758,8 @@ struct LinuxApp {
                     bwTransport.connect(address: connectedDev.address, name: connectedDev.name)
                 } else if connectedDev.providerID == "sony" && sonyProvider.connectionState == .idle {
                     sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
+                } else if connectedDev.providerID == "apple" && appleProvider.connectionState == .idle {
+                    appleTransport.connect(address: connectedDev.address, name: connectedDev.name)
                 }
             }
 
@@ -744,6 +796,7 @@ struct LinuxApp {
         case .noiseCancellation: return "Noise Cancellation"
         case .ambient: return "Ambient / Pass Through"
         case .windReduction: return "Wind Reduction"
+        case .adaptive: return "Adaptive"
         case .off: return "Off"
         }
     }
@@ -765,10 +818,10 @@ struct LinuxApp {
 
         COMMANDS:
             status                      Show status of connected headphone (default)
-            devices                     List paired Bowers & Wilkins and Sony devices
+            devices                     List paired AirPods, Beats, Bowers & Wilkins, and Sony devices
             connect [address|name]      Connect to headphone
             disconnect                  Disconnect active headphone session
-            anc [off|anc|ambient]       Get or set Active Noise Cancellation mode
+            anc [off|anc|ambient|adaptive] Get or set Active Noise Cancellation / Listening mode
             ambient-level [0-20]        Get or set Sony ambient sound level
             eq [bass <n>] [treble <n>]  Get or set tone / EQ controls (-60 to +60)
             battery                     Show battery percentage and charging status

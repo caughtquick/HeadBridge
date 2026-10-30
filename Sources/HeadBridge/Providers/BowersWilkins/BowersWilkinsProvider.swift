@@ -1,9 +1,7 @@
 #if canImport(Combine)
 import Combine
 #endif
-#if canImport(CoreBluetooth)
-import CoreBluetooth
-#endif
+
 import Foundation
 
 enum ANCMode: Int, CaseIterable, Identifiable {
@@ -71,9 +69,7 @@ struct DiscoveredPeripheral: Identifiable {
     let id: UUID
     let name: String
     let rssi: Int
-    #if canImport(CoreBluetooth)
-    fileprivate let peripheral: CBPeripheral
-    #endif
+
 }
 
 struct ProbeReading: Identifiable {
@@ -243,77 +239,7 @@ struct BWAutomaticConnectionTracker: Equatable {
     }
 }
 
-#if canImport(CoreBluetooth)
-private enum BWPeripheralEvent {
-    case discoveredServices(Error?)
-    case discoveredCharacteristics(CBService, Error?)
-    case updatedNotificationState(CBCharacteristic, Error?)
-    case updatedValue(CBCharacteristic, Error?)
-    case wroteValue(CBCharacteristic, Error?)
-    case readyToWriteWithoutResponse
-}
 
-private final class BWPeripheralDelegateProxy: NSObject, CBPeripheralDelegate {
-    let generation: Int
-    private let handler: @MainActor (Int, CBPeripheral, BWPeripheralEvent) -> Void
-
-    init(
-        generation: Int,
-        handler: @escaping @MainActor (Int, CBPeripheral, BWPeripheralEvent) -> Void
-    ) {
-        self.generation = generation
-        self.handler = handler
-    }
-
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        forward(peripheral, .discoveredServices(error))
-    }
-
-    func peripheral(
-        _ peripheral: CBPeripheral,
-        didDiscoverCharacteristicsFor service: CBService,
-        error: Error?
-    ) {
-        forward(peripheral, .discoveredCharacteristics(service, error))
-    }
-
-    func peripheral(
-        _ peripheral: CBPeripheral,
-        didUpdateNotificationStateFor characteristic: CBCharacteristic,
-        error: Error?
-    ) {
-        forward(peripheral, .updatedNotificationState(characteristic, error))
-    }
-
-    func peripheral(
-        _ peripheral: CBPeripheral,
-        didUpdateValueFor characteristic: CBCharacteristic,
-        error: Error?
-    ) {
-        forward(peripheral, .updatedValue(characteristic, error))
-    }
-
-    func peripheral(
-        _ peripheral: CBPeripheral,
-        didWriteValueFor characteristic: CBCharacteristic,
-        error: Error?
-    ) {
-        forward(peripheral, .wroteValue(characteristic, error))
-    }
-
-    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
-        forward(peripheral, .readyToWriteWithoutResponse)
-    }
-
-    private func forward(_ peripheral: CBPeripheral, _ event: BWPeripheralEvent) {
-        let generation = generation
-        let handler = handler
-        Task { @MainActor in
-            handler(generation, peripheral, event)
-        }
-    }
-}
-#endif
 
 @MainActor
 final class BowersWilkinsProvider: NSObject, ObservableObject {
@@ -391,15 +317,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     @Published private(set) var log: [TransportLogEntry] = []
     @Published private(set) var pairedDevices: [PairedDeviceInfo] = []
 
-    #if canImport(CoreBluetooth)
-    private var central: CBCentralManager!
-    private var peripheral: CBPeripheral?
-    private var requestCharacteristic: CBCharacteristic?
-    private var responseCharacteristic: CBCharacteristic?
-    private var eventCharacteristic: CBCharacteristic?
-    private var peripheralDelegateProxy: BWPeripheralDelegateProxy?
-    private var teardownPeripheral: CBPeripheral?
-    #endif
+
     private var transport: (any BowersWilkinsTransportProtocol)?
     private var discovered: [UUID: DiscoveredPeripheral] = [:]
     private var transportReadiness = BWRPCTransportReadiness()
@@ -436,24 +354,6 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     private static let maximumAutomaticReconnectAttempts = 2
     private static let maximumQueuedWrites = 128
 
-    #if canImport(CoreBluetooth)
-    override init() {
-        super.init()
-        restoreOnConnectEnabled = HeadphoneProfileStore.isRestoreEnabled(for: "bowers-wilkins")
-        central = CBCentralManager(delegate: self, queue: nil)
-    }
-
-    init(transport: (any BowersWilkinsTransportProtocol)? = nil) {
-        super.init()
-        self.transport = transport
-        restoreOnConnectEnabled = HeadphoneProfileStore.isRestoreEnabled(for: "bowers-wilkins")
-        if let transport {
-            configureTransport(transport)
-        } else {
-            central = CBCentralManager(delegate: self, queue: nil)
-        }
-    }
-    #else
     init(transport: (any BowersWilkinsTransportProtocol)? = nil) {
         super.init()
         self.transport = transport
@@ -462,7 +362,6 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
             configureTransport(transport)
         }
     }
-    #endif
 
     func configureTransport(_ transport: any BowersWilkinsTransportProtocol) {
         self.transport = transport
@@ -1817,146 +1716,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
         }
     }
 
-    #if canImport(CoreBluetooth)
-    private func handlePeripheralEvent(
-        _ event: BWPeripheralEvent,
-        from callbackPeripheral: CBPeripheral,
-        generation: Int
-    ) {
-        guard isCurrentPeripheralCallback(callbackPeripheral, generation: generation) else { return }
 
-        switch event {
-        case .discoveredServices(let error):
-            guard phase == .discovering else { return }
-            if let error {
-                failTransport(error.localizedDescription, peripheral: callbackPeripheral)
-                return
-            }
-            guard let services = callbackPeripheral.services, !services.isEmpty else {
-                failTransport("No BLE services found", peripheral: callbackPeripheral)
-                return
-            }
-            services.forEach { callbackPeripheral.discoverCharacteristics(nil, for: $0) }
-
-        case .discoveredCharacteristics(let service, let error):
-            guard phase == .discovering, service.peripheral === callbackPeripheral else { return }
-            if let error {
-                addLog(.info, "Characteristic discovery failed: \(error.localizedDescription)")
-                return
-            }
-            for characteristic in service.characteristics ?? [] {
-                switch characteristic.uuid.uuidString.lowercased() {
-                case BWRPC.requestUUID:
-                    requestCharacteristic = characteristic
-                    transportReadiness.requestDiscovered = true
-                case BWRPC.responseUUID:
-                    guard responseCharacteristic !== characteristic else { continue }
-                    responseCharacteristic = characteristic
-                    transportReadiness.responseDiscovered = true
-                    transportReadiness.responseNotificationsConfirmed = false
-                    callbackPeripheral.setNotifyValue(true, for: characteristic)
-                case BWRPC.notificationUUID:
-                    guard eventCharacteristic !== characteristic else { continue }
-                    eventCharacteristic = characteristic
-                    callbackPeripheral.setNotifyValue(true, for: characteristic)
-                default:
-                    break
-                }
-            }
-            transportMayBeReady()
-
-        case .updatedNotificationState(let characteristic, let error):
-            if characteristic === eventCharacteristic {
-                if let error {
-                    addLog(.info, "Event notification setup failed: \(error.localizedDescription)")
-                }
-                return
-            }
-            guard characteristic === responseCharacteristic,
-                phase == .discovering || phase == .ready
-            else { return }
-
-            if let error {
-                failTransport(
-                    "RPC notification setup failed: \(error.localizedDescription)",
-                    peripheral: callbackPeripheral
-                )
-                return
-            }
-            guard characteristic.isNotifying else {
-                failTransport("RPC notifications are unavailable", peripheral: callbackPeripheral)
-                return
-            }
-            transportReadiness.responseNotificationsConfirmed = true
-            transportMayBeReady()
-
-        case .updatedValue(let characteristic, let error):
-            guard phase == .ready,
-                characteristic === responseCharacteristic || characteristic === eventCharacteristic
-            else { return }
-            if let error {
-                addLog(.info, "GATT notification error: \(error.localizedDescription)")
-                return
-            }
-            if let data = characteristic.value { handle(data) }
-
-        case .wroteValue(let characteristic, let error):
-            guard phase == .ready,
-                characteristic === requestCharacteristic,
-                writeInFlight
-            else { return }
-            cancelWriteTimeout()
-            writeInFlight = false
-            activeWriteCommandKey = nil
-            if let error {
-                failTransport("GATT write failed: \(error.localizedDescription)", peripheral: callbackPeripheral)
-                return
-            }
-            pumpWriteQueue()
-
-        case .readyToWriteWithoutResponse:
-            guard phase == .ready else { return }
-            pumpWriteQueue()
-        }
-    }
-
-    private func isCurrentPeripheralCallback(_ callbackPeripheral: CBPeripheral, generation: Int) -> Bool {
-        guard isCurrentPeripheralSession(callbackPeripheral),
-            let activeSessionIdentity,
-            activeSessionIdentity.accepts(
-                peripheralID: callbackPeripheral.identifier,
-                generation: generation
-            ),
-            let peripheralDelegateProxy,
-            peripheralDelegateProxy.generation == generation,
-            callbackPeripheral.delegate === peripheralDelegateProxy
-        else { return false }
-        return true
-    }
-
-    private func isCurrentPeripheralSession(_ candidate: CBPeripheral) -> Bool {
-        guard let activeSessionIdentity,
-            activeSessionIdentity.accepts(
-                peripheralID: candidate.identifier,
-                generation: transportGeneration
-            ),
-            peripheral === candidate
-        else { return false }
-        return true
-    }
-
-    private func failTransport(_ message: String, peripheral failedPeripheral: CBPeripheral) {
-        guard peripheral === failedPeripheral else { return }
-        cancelConnectionTimeout()
-        let releasedPeripheral = releasePeripheral()
-        phase = .failed(message)
-        if let releasedPeripheral {
-            beginTeardown(of: releasedPeripheral, reconnectWhenFinished: true)
-        } else {
-            scheduleAutomaticReconnect()
-        }
-    }
-    #endif
 
     private func addLog(_ direction: TransportLogEntry.Direction, _ text: String) {
         guard diagnosticsEnabled else { return }
@@ -1965,134 +1725,7 @@ final class BowersWilkinsProvider: NSObject, ObservableObject {
     }
 }
 
-#if canImport(CoreBluetooth)
-extension BowersWilkinsProvider: CBCentralManagerDelegate {
-    nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        Task { @MainActor in
-            guard self.central === central else { return }
-            switch central.state {
-            case .poweredOn:
-                automaticConnection.resetCandidates()
-                cancelAutomaticReconnect()
-                if phase == .bluetoothUnavailable {
-                    phase = .idle
-                }
-                if audioConnectedDeviceNames.isEmpty {
-                    phase = .idle
-                } else {
-                    startScanning(automatically: true)
-                }
-            case .unsupported, .unauthorized, .poweredOff, .resetting:
-                cancelAutomaticReconnect()
-                cancelScanTimeout()
-                cancelConnectionTimeout()
-                pendingConnection = nil
-                automaticConnection.resetForBluetoothRadioTransition()
-                rejectedPeripheralIDs.removeAll()
-                identityRejections.reset()
-                central.stopScan()
-                _ = releasePeripheral()
-                cancelTeardownTracking()
-                phase = .bluetoothUnavailable
-            default: break
-            }
-        }
-    }
 
-    nonisolated func centralManager(
-        _ central: CBCentralManager,
-        didDiscover peripheral: CBPeripheral,
-        advertisementData: [String: Any],
-        rssi RSSI: NSNumber
-    ) {
-        Task { @MainActor in
-            guard self.central === central, self.phase == .scanning else { return }
-            let advertised = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-            let name = advertised ?? peripheral.name ?? "Unnamed BLE device"
-            guard Self.isDiscoverableAdvertisedName(name) else { return }
-            let item = DiscoveredPeripheral(
-                id: peripheral.identifier, name: name, rssi: RSSI.intValue, peripheral: peripheral)
-            discovered[peripheral.identifier] = item
-            peripherals = discovered.values.sorted { $0.rssi > $1.rssi }
-            if selectedPeripheralID == nil {
-                selectedPeripheralID = peripheral.identifier
-            }
-            tryAutomaticConnection()
-        }
-    }
-
-    nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        Task { @MainActor in
-            if self.teardownPeripheral === peripheral {
-                central.cancelPeripheralConnection(peripheral)
-                return
-            }
-            guard self.central === central,
-                self.isCurrentPeripheralSession(peripheral),
-                self.phase == .connecting
-            else {
-                central.cancelPeripheralConnection(peripheral)
-                return
-            }
-            cancelConnectionTimeout()
-            cancelAutomaticReconnect(resetAttempt: false)
-            phase = .discovering
-            addLog(.info, "Connected; discovering every GATT service")
-            armConnectionTimeout(
-                for: peripheral.identifier,
-                expectedPhase: .discovering,
-                after: Self.discoveryTimeout,
-                failureMessage: "RPC discovery timed out"
-            )
-            peripheral.discoverServices(nil)
-        }
-    }
-
-    nonisolated func centralManager(
-        _ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?
-    ) {
-        Task { @MainActor in
-            if self.central === central, self.teardownPeripheral === peripheral {
-                self.finishTeardown(of: peripheral)
-                return
-            }
-            guard self.central === central,
-                self.isCurrentPeripheralSession(peripheral),
-                self.phase == .connecting
-            else { return }
-            cancelConnectionTimeout()
-            _ = releasePeripheral()
-            phase = .failed(error?.localizedDescription ?? "Connection failed")
-            scheduleAutomaticReconnect()
-        }
-    }
-
-    nonisolated func centralManager(
-        _ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
-    ) {
-        Task { @MainActor in
-            if self.central === central, self.teardownPeripheral === peripheral {
-                self.finishTeardown(of: peripheral)
-                return
-            }
-            guard self.central === central,
-                self.isCurrentPeripheralSession(peripheral)
-            else { return }
-            cancelConnectionTimeout()
-            let nextConnection = pendingConnection
-            pendingConnection = nil
-            _ = releasePeripheral()
-            if let nextConnection {
-                phase = .idle
-                connect(nextConnection.item, automatically: nextConnection.automatically)
-                return
-            }
-            phase = error.map { .failed($0.localizedDescription) } ?? .idle
-            scheduleAutomaticReconnect()
-        }
-    }
-}
-#endif
 
 extension BowersWilkinsProvider: HeadphoneProvider {
     var providerID: String { "bowers-wilkins" }
@@ -2178,7 +1811,7 @@ extension BowersWilkinsProvider: HeadphoneProvider {
         case .off: setANC(.off)
         case .noiseCancellation: setANC(.noiseCancellation)
         case .ambient: setANC(.passThrough)
-        case .windReduction: break
+        case .windReduction, .adaptive: break
         }
     }
 }

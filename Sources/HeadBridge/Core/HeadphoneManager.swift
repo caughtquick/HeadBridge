@@ -2,43 +2,41 @@
 import Combine
 #endif
 import Foundation
-#if canImport(CoreAudio)
-import CoreAudio
-#endif
+
+struct RecognizedHeadphoneDevice: Identifiable, Equatable {
+    let id: String
+    let deviceID: String
+    let name: String
+    let address: String
+    let isConnected: Bool
+    let providerID: String
+    let vendorName: String
+
+    var title: String { name }
+
+    var subtitle: String {
+        "\(vendorName) • \(isConnected ? "Connected" : "Not connected")"
+    }
+
+    var iconName: String {
+        switch vendorName.lowercased() {
+        case "sony":
+            return "headphones"
+        case "bowers & wilkins":
+            return "waveform.circle.fill"
+        case "apple":
+            return "airpodspro"
+        default:
+            return "headphones"
+        }
+    }
+}
 
 private struct HeadphoneVolumeSyncState: Equatable {
     let normalizedVolume: Float
     let deviceID: AudioDeviceID?
     let enabled: Bool
     let providerReady: Bool
-}
-
-public struct RecognizedHeadphoneDevice: Identifiable, Equatable, Sendable {
-    public let id: String
-    public let deviceID: String
-    public let name: String
-    public let address: String
-    public let isConnected: Bool
-    public let providerID: String
-    public let vendorName: String
-
-    public init(
-        id: String,
-        deviceID: String,
-        name: String,
-        address: String,
-        isConnected: Bool,
-        providerID: String,
-        vendorName: String
-    ) {
-        self.id = id
-        self.deviceID = deviceID
-        self.name = name
-        self.address = address
-        self.isConnected = isConnected
-        self.providerID = providerID
-        self.vendorName = vendorName
-    }
 }
 
 @MainActor
@@ -48,9 +46,6 @@ final class HeadphoneManager: ObservableObject {
 
     private var cancellables: Set<AnyCancellable> = []
     private var isShutdown = false
-    #if os(macOS)
-    private var inventoryQuery: BluetoothInventoryQuery?
-    #endif
     private var inventoryGeneration = 0
     private var isRefreshingInventory = false
     private var needsInventoryRefresh = false
@@ -120,32 +115,6 @@ final class HeadphoneManager: ObservableObject {
         inventoryGeneration &+= 1
         let expectedGeneration = inventoryGeneration
 
-        #if os(macOS)
-        let query = BluetoothInventoryQuery()
-        inventoryQuery = query
-
-        Self.inventoryQueue.async {
-            let devices = query.run().flatMap(BluetoothDeviceInventory.decode)
-            DispatchQueue.main.async { [weak self] in
-                guard let self,
-                    !self.isShutdown,
-                    self.inventoryGeneration == expectedGeneration,
-                    self.inventoryQuery === query
-                else { return }
-
-                self.inventoryQuery = nil
-                self.isRefreshingInventory = false
-                if let devices {
-                    self.applyBluetoothPairedDevices(devices)
-                }
-
-                if self.needsInventoryRefresh {
-                    self.needsInventoryRefresh = false
-                    self.refreshBluetoothDevices()
-                }
-            }
-        }
-        #else
         Self.inventoryQueue.async {
             let devices = LinuxBluetoothInventory.fetchPairedDevices()
             DispatchQueue.main.async { [weak self] in
@@ -165,7 +134,6 @@ final class HeadphoneManager: ObservableObject {
                 }
             }
         }
-        #endif
     }
 
     func applyBluetoothPairedDevices(_ devices: [BluetoothPairedDevice]) {
@@ -200,26 +168,20 @@ final class HeadphoneManager: ObservableObject {
     }
 
     /// Stops aggregate subscriptions before asking every provider to release
-    /// its transport. The operation is deliberately idempotent because AppKit
-    /// can deliver more than one terminal lifecycle notification.
+    /// its transport.
     func shutdown() {
         guard !isShutdown else { return }
         isShutdown = true
         inventoryGeneration &+= 1
-        #if os(macOS)
-        inventoryQuery?.cancel()
-        inventoryQuery = nil
-        #endif
         isRefreshingInventory = false
         needsInventoryRefresh = false
         cancellables.removeAll()
         providers.forEach { $0.shutdown() }
     }
 
-    #if os(macOS)
     func installVolumeSynchronization(
         settings: AppSettings,
-        systemAudio: SystemAudioController
+        systemAudio: any AudioControllerProtocol
     ) {
         for provider in providers where provider.supportsSystemVolumeSynchronization {
             settings.registerVolumeSynchronization(
@@ -272,5 +234,4 @@ final class HeadphoneManager: ObservableObject {
             }
             .store(in: &cancellables)
     }
-    #endif
 }

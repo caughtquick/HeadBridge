@@ -61,11 +61,7 @@ final class SonyV1Client {
     private static let maximumQueuedCommands = 128
 
     convenience init() {
-        #if os(macOS)
-        self.init(transport: SonyRFCOMMTransport())
-        #else
         self.init(transport: LinuxSonyRFCOMMTransport())
-        #endif
     }
 
     init(transport: any SonyRFCOMMTransportProtocol) {

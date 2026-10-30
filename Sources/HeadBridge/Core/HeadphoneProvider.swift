@@ -33,6 +33,7 @@ enum HeadphoneNoiseMode: Int, CaseIterable, Identifiable {
     case noiseCancellation = 1
     case ambient = 2
     case windReduction = 3
+    case adaptive = 4
 
     var id: Int { rawValue }
 
@@ -42,6 +43,7 @@ enum HeadphoneNoiseMode: Int, CaseIterable, Identifiable {
         case .noiseCancellation: "Noise Cancellation"
         case .ambient: "Ambient"
         case .windReduction: "Wind Reduction"
+        case .adaptive: "Adaptive"
         }
     }
 
@@ -51,6 +53,7 @@ enum HeadphoneNoiseMode: Int, CaseIterable, Identifiable {
         case .noiseCancellation: "waveform.badge.minus"
         case .ambient: "ear"
         case .windReduction: "wind"
+        case .adaptive: "sparkles"
         }
     }
 }

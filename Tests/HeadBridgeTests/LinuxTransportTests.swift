@@ -10,7 +10,7 @@ final class LinuxTransportTests: XCTestCase {
         XCTAssertNil(runner.findExecutable("non_existent_executable_12345"))
     }
 
-    #if !os(macOS)
+
     @MainActor
     func testLinuxBowersWilkinsTransportStateTransitionsAndSimulation() async {
         let transport = LinuxBowersWilkinsTransport()
@@ -160,5 +160,4 @@ final class LinuxTransportTests: XCTestCase {
         XCTAssertTrue(data.path.contains("headbridge") || data.path.contains("HeadBridge"))
         XCTAssertTrue(state.path.contains("headbridge") || state.path.contains("HeadBridge"))
     }
-    #endif
 }

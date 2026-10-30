@@ -1,6 +1,6 @@
 import Foundation
 
-#if !os(macOS)
+
 @MainActor
 final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
     var onConnectionStateChange: ((HeadphoneConnectionState) -> Void)?
@@ -475,4 +475,4 @@ final class LinuxBowersWilkinsTransport: BowersWilkinsTransportProtocol {
         transition(to: state)
     }
 }
-#endif
+

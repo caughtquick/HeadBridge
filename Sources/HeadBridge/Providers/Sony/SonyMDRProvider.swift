@@ -69,9 +69,7 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
     private var pendingRestorableProfile: SonyRestorableProfile?
     private var isRefreshingDevices = false
     private var needsDeviceRefresh = false
-    #if os(macOS)
-    private var inventoryQuery: BluetoothInventoryQuery?
-    #endif
+
     private var inventoryGeneration = 0
     private var diagnosticsEnabled = false
     private let logger = Logger(subsystem: "io.github.herenickname.HeadBridge", category: "Sony")
@@ -166,35 +164,6 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
         isRefreshingDevices = true
         inventoryGeneration &+= 1
         let expectedGeneration = inventoryGeneration
-        #if os(macOS)
-        let query = BluetoothInventoryQuery()
-        inventoryQuery = query
-
-        // `IOBluetoothDevice.pairedDevices()` can block on macOS 26. Reading
-        // the same inventory in a bounded child process keeps AppKit and the
-        // menu-bar extra responsive.
-        Self.deviceDiscoveryQueue.async {
-            let discovered = Self.readBluetoothInventory(using: query)
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self,
-                    self.inventoryGeneration == expectedGeneration,
-                    self.inventoryQuery === query
-                else { return }
-                self.inventoryQuery = nil
-                self.isRefreshingDevices = false
-                if let discovered {
-                    self.devices = discovered.filter { Self.isSupportedHeadphoneName($0.name) }
-                }
-                self.connectToMatchingAudioDeviceIfNeeded()
-
-                if self.needsDeviceRefresh {
-                    self.needsDeviceRefresh = false
-                    self.refreshDevices()
-                }
-            }
-        }
-        #else
         Self.deviceDiscoveryQueue.async {
             let discovered = LinuxBluetoothInventory.fetchPairedDevices()
 
@@ -214,7 +183,6 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
                 }
             }
         }
-        #endif
     }
 
     func connect(to device: BluetoothPairedDevice) {
@@ -253,6 +221,7 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
             case .noiseCancellation: .noiseCancellation
             case .ambient: .ambient
             case .windReduction: .windReduction
+            case .adaptive: .ambient
             }
         client.setNoiseMode(sonyMode, ambientLevel: desired.ambientLevel)
     }
@@ -384,10 +353,6 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
 
     private func cancelDeviceRefresh() {
         inventoryGeneration &+= 1
-        #if os(macOS)
-        inventoryQuery?.cancel()
-        inventoryQuery = nil
-        #endif
         isRefreshingDevices = false
         needsDeviceRefresh = false
     }
@@ -519,6 +484,7 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
                 case .noiseCancellation: .noiseCancellation
                 case .ambient: .ambient
                 case .windReduction: .windReduction
+                case .adaptive: .ambient
                 }
             client.setNoiseMode(sonyMode, ambientLevel: profile.ambientLevel)
         }
@@ -663,16 +629,7 @@ final class SonyMDRProvider: ObservableObject, HeadphoneProvider {
         return true
     }
 
-    #if os(macOS)
-    private nonisolated static func readBluetoothInventory(
-        using query: BluetoothInventoryQuery
-    ) -> [BluetoothPairedDevice]? {
-        guard let data = query.run(),
-            let devices = BluetoothDeviceInventory.decode(data)
-        else { return nil }
-        return devices.filter { isSupportedHeadphoneName($0.name) }
-    }
-    #endif
+
 
     nonisolated static func volumeStep(for normalized: Float) -> Int {
         min(30, max(0, Int((normalized * 30).rounded())))

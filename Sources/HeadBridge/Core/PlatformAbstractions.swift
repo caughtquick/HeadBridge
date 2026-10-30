@@ -69,6 +69,36 @@ public struct AnyPublisher<Output, Failure: Error> {
     public func receive(on runloop: RunLoop) -> AnyPublisher<Output, Failure> {
         self
     }
+
+    public func combineLatest<OtherOutput>(_ other: AnyPublisher<OtherOutput, Failure>) -> AnyPublisher<(Output, OtherOutput), Failure> {
+        AnyPublisher<(Output, OtherOutput), Failure> { downstream in
+            let lock = NSLock()
+            var currentSelf: Output?
+            var currentOther: OtherOutput?
+            let c1 = self.subscribe { val in
+                lock.lock()
+                currentSelf = val
+                let pair = currentOther.map { (val, $0) }
+                lock.unlock()
+                if let pair {
+                    downstream(pair)
+                }
+            }
+            let c2 = other.subscribe { val in
+                lock.lock()
+                currentOther = val
+                let pair = currentSelf.map { ($0, val) }
+                lock.unlock()
+                if let pair {
+                    downstream(pair)
+                }
+            }
+            return AnyCancellable {
+                c1.cancel()
+                c2.cancel()
+            }
+        }
+    }
 }
 
 extension AnyPublisher where Output: Equatable {
@@ -306,7 +336,6 @@ public struct Logger: Sendable {
 }
 #endif
 
-#if !os(macOS)
 public typealias AudioDeviceID = UInt32
 public let kAudioDeviceTransportTypeUnknown: UInt32 = 0
 public let kAudioDeviceTransportTypeBuiltIn: UInt32 = 1
@@ -320,60 +349,37 @@ public let kAudioDeviceTransportTypeVirtual: UInt32 = 8
 public typealias IOReturn = Int32
 public let kIOReturnSuccess: IOReturn = 0
 public let kIOReturnError: IOReturn = -1
-#endif
 
 public enum AppPlatformPaths {
     public static var configDirectory: URL {
-        #if os(macOS)
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("HeadBridge", isDirectory: true)
-        #else
         if let xdgConfig = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !xdgConfig.isEmpty {
             return URL(fileURLWithPath: xdgConfig).appendingPathComponent("headbridge", isDirectory: true)
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home.appendingPathComponent(".config/headbridge", isDirectory: true)
-        #endif
     }
 
     public static var dataDirectory: URL {
-        #if os(macOS)
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("HeadBridge", isDirectory: true)
-        #else
         if let xdgData = ProcessInfo.processInfo.environment["XDG_DATA_HOME"], !xdgData.isEmpty {
             return URL(fileURLWithPath: xdgData).appendingPathComponent("headbridge", isDirectory: true)
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home.appendingPathComponent(".local/share/headbridge", isDirectory: true)
-        #endif
     }
 
     public static var stateDirectory: URL {
-        #if os(macOS)
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("HeadBridge", isDirectory: true)
-        #else
         if let xdgState = ProcessInfo.processInfo.environment["XDG_STATE_HOME"], !xdgState.isEmpty {
             return URL(fileURLWithPath: xdgState).appendingPathComponent("headbridge", isDirectory: true)
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home.appendingPathComponent(".local/state/headbridge", isDirectory: true)
-        #endif
     }
 
     public static var runtimeDirectory: URL {
-        #if os(macOS)
-        return configDirectory
-        #else
         if let xdgRuntime = ProcessInfo.processInfo.environment["XDG_RUNTIME_DIR"], !xdgRuntime.isEmpty {
             return URL(fileURLWithPath: xdgRuntime)
         }
         return stateDirectory
-        #endif
     }
 }
 

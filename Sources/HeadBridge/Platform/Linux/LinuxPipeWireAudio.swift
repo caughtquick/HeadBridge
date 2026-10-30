@@ -1,6 +1,6 @@
 import Foundation
 
-#if !os(macOS)
+
 @MainActor
 public final class LinuxPipeWireAudio: ObservableObject, AudioControllerProtocol {
     @Published public private(set) var devices: [SystemAudioDevice] = []
@@ -240,4 +240,4 @@ public final class LinuxPipeWireAudio: ObservableObject, AudioControllerProtocol
         volume = newVol
     }
 }
-#endif
+

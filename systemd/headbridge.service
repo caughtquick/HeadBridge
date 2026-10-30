@@ -1,0 +1,11 @@
+[Unit]
+Description=HeadBridge Bluetooth Headphone Daemon
+After=bluetooth.target pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/headbridge daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

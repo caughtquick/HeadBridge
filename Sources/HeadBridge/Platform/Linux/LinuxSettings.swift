@@ -1,6 +1,6 @@
 import Foundation
 
-#if !os(macOS)
+
 public struct LinuxHeadphoneProfile: Codable, Equatable, Sendable {
     public var noiseMode: String?
     public var ambientLevel: Int?
@@ -95,4 +95,3 @@ public final class LinuxSettingsStore {
         save()
     }
 }
-#endif
