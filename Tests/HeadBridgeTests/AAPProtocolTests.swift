@@ -140,4 +140,24 @@ final class AAPProtocolTests: XCTestCase {
         let convOffNotice = AAPProtocol.SettingNotice.parse(from: convOffParsed!)
         XCTAssertEqual(convOffNotice?.data.first, 2)
     }
+
+    func testHandshakeAndFeatureRawBytes() {
+        XCTAssertEqual(AAPProtocol.handshakeRawBytes.count, 16)
+        XCTAssertEqual(AAPProtocol.handshakeRawBytes[0...3], [0x00, 0x00, 0x04, 0x00])
+
+        XCTAssertEqual(AAPProtocol.setFeaturesPro2Bytes.count, 14)
+        XCTAssertEqual(AAPProtocol.setFeaturesPro2Bytes[4], AAPProtocol.Opcode.featureFlags.rawValue)
+        XCTAssertEqual(AAPProtocol.setFeaturesPro2Bytes[6], 0xD7)
+    }
+
+    func testSubscribeNotificationsFrame() {
+        let frame = AAPProtocol.subscribeNotificationsFrame()
+        let encoded = [UInt8](frame.encode())
+        let expected: [UInt8] = [
+            0x04, 0x00, 0x04, 0x00,
+            0x0F, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+        ]
+        XCTAssertEqual(encoded, expected)
+    }
 }

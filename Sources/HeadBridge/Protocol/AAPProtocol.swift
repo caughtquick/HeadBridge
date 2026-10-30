@@ -159,12 +159,25 @@ public enum AAPProtocol {
 
     // MARK: - Frame Builders
 
+    /// Raw handshake frame required by AirPods Pro 2 and modern AAP firmware (16 bytes).
+    public static let handshakeRawBytes: [UInt8] = [
+        0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    ]
+
+    /// Feature flag packet with mask 0xD7 required to enable battery notifications on AirPods Pro 2.
+    public static let setFeaturesPro2Bytes: [UInt8] = [
+        0x04, 0x00, 0x04, 0x00, 0x4D, 0x00, 0xD7, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    ]
+
     public static func handshakeFrame() -> Frame {
         Frame(opcode: .handshake, subop: 0x01, payload: Data([0x01, 0x00, 0x02, 0x00]))
     }
 
+    /// Subscribes to unsolicited telemetry notifications (opcode 0x0F, subop 0x00, 5 bytes of 0xFF).
     public static func subscribeNotificationsFrame() -> Frame {
-        Frame(opcode: .subscribeNotif, subop: 0x01, payload: Data([0x01]))
+        Frame(opcode: .subscribeNotif, subop: 0x00, payload: Data([0xFF, 0xFF, 0xFF, 0xFF, 0xFF]))
     }
 
     public static func writeSetting(id: UInt8, value: UInt8) -> Frame {

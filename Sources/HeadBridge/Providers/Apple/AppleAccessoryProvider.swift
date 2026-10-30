@@ -78,7 +78,7 @@ final class AppleAccessoryProvider: NSObject, HeadphoneProvider, ObservableObjec
             guard let self else { return }
             self.connectionState = state
             if state == .ready {
-                self.sendHandshake()
+                self.startSession()
             } else if case .failed = state {
                 self.resetTelemetry()
             } else if state == .idle {
@@ -94,11 +94,27 @@ final class AppleAccessoryProvider: NSObject, HeadphoneProvider, ObservableObjec
 
     // MARK: - Handshake & Telemetry
 
-    private func sendHandshake() {
-        do {
-            try transport.send(frame: AAPProtocol.handshakeFrame())
-        } catch {
-            // Handshake send failed
+    private func startSession() {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                // 1. Handshake (16 bytes: 00 00 04 00 01 00 02 00 00 ...)
+                try self.transport.send(data: Data(AAPProtocol.handshakeRawBytes))
+                try await Task.sleep(nanoseconds: 200_000_000)
+                guard self.connectionState == .ready else { return }
+
+                // 2. Set features for Pro 2 / unknown Apple models (0x4D with 0xD7 mask enables battery notifications)
+                if self.appleModel == .unknown || self.appleModel == .pro2 || self.appleModel == .pro2UsbC || self.appleModel == .pro3 {
+                    try self.transport.send(data: Data(AAPProtocol.setFeaturesPro2Bytes))
+                    try await Task.sleep(nanoseconds: 200_000_000)
+                    guard self.connectionState == .ready else { return }
+                }
+
+                // 3. Subscribe to notifications (opcode 0x0F, subop 0x00, 5 bytes 0xFF)
+                try self.transport.send(frame: AAPProtocol.subscribeNotificationsFrame())
+            } catch {
+                // transport write error logged by transport
+            }
         }
     }
 
@@ -232,7 +248,7 @@ final class AppleAccessoryProvider: NSObject, HeadphoneProvider, ObservableObjec
         self.pairedDevices = devices
         for dev in devices {
             if recognizesBluetoothDevice(named: dev.name) {
-                detectModel(for: dev.address)
+                detectModel(for: dev.address, name: dev.name)
             }
         }
     }
@@ -256,11 +272,11 @@ final class AppleAccessoryProvider: NSObject, HeadphoneProvider, ObservableObjec
         guard connectionState != .ready, !connectionState.isConnecting else { return }
         connectedDeviceID = device.address
         connectedName = device.name
-        detectModel(for: device.address)
+        detectModel(for: device.address, name: device.name)
         transport.connect(address: device.address, name: device.name)
     }
 
-    private func detectModel(for address: String) {
+    private func detectModel(for address: String, name: String? = nil) {
         if let result = LinuxCommandRunner.shared.run("bluetoothctl", arguments: ["info", address]),
            result.exitCode == 0 {
             for line in result.stdout.components(separatedBy: "\n") {
@@ -270,8 +286,15 @@ final class AppleAccessoryProvider: NSObject, HeadphoneProvider, ObservableObjec
                     let detected = AppleModel.from(modalias: modalias)
                     if detected != .unknown {
                         self.appleModel = detected
+                        return
                     }
                 }
+            }
+        }
+        if let name = name, self.appleModel == .unknown {
+            let fallback = AppleModel.from(name: name)
+            if fallback != .unknown {
+                self.appleModel = fallback
             }
         }
     }
@@ -280,7 +303,7 @@ final class AppleAccessoryProvider: NSObject, HeadphoneProvider, ObservableObjec
 
     func refresh() {
         if connectionState == .ready {
-            sendHandshake()
+            startSession()
         }
     }
 

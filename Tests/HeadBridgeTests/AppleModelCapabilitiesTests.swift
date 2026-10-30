@@ -64,4 +64,12 @@ final class AppleModelCapabilitiesTests: XCTestCase {
         XCTAssertTrue(caps.hasInEarDetection)
         XCTAssertTrue(caps.hasSpatialAudio)
     }
+
+    func testNameFallback() {
+        XCTAssertEqual(AppleModel.from(name: "Abhijit’s AirPods Pro"), .pro)
+        XCTAssertEqual(AppleModel.from(name: "AirPods Pro 2"), .pro2)
+        XCTAssertEqual(AppleModel.from(name: "AirPods Max"), .max)
+        XCTAssertEqual(AppleModel.from(name: "Beats Fit Pro"), .beatsFitPro)
+        XCTAssertEqual(AppleModel.from(name: "Unknown Device"), .unknown)
+    }
 }

@@ -55,18 +55,54 @@ public enum AppleModel: String, CaseIterable, Sendable {
     /// Extract product code from Linux BlueZ modalias string, e.g. "bluetooth:v004Cp2024d..."
     public static func from(modalias: String) -> AppleModel {
         let lower = modalias.lowercased()
-        guard lower.contains("v004c") else {
+        guard let vRange = lower.range(of: "v004c") else {
             return .unknown
         }
-        guard let pRange = lower.range(of: "p") else {
+        let afterV = lower[vRange.upperBound...]
+        guard let pRange = afterV.range(of: "p") else {
             return .unknown
         }
-        let afterP = lower[pRange.upperBound...]
+        let afterP = afterV[pRange.upperBound...]
         let hexString = String(afterP.prefix(4))
         guard hexString.count == 4, hexString.allSatisfy(\.isHexDigit), let code = UInt16(hexString, radix: 16) else {
             return .unknown
         }
         return from(productCode: code)
+    }
+
+    /// Fallback device model inference from Bluetooth broadcast name.
+    public static func from(name: String) -> AppleModel {
+        let lower = name.lowercased()
+        if lower.contains("beats fit pro") {
+            return .beatsFitPro
+        } else if lower.contains("beats studio pro") {
+            return .beatsStudioPro
+        } else if lower.contains("beats studio buds") {
+            return .beatsStudioBudsPlus
+        } else if lower.contains("beats solo 4") {
+            return .beatsSolo4
+        } else if lower.contains("beats solo buds") {
+            return .beatsSoloBuds
+        } else if lower.contains("pro 2") || lower.contains("pro (2") || lower.contains("pro 2nd") {
+            return .pro2
+        } else if lower.contains("pro 3") {
+            return .pro3
+        } else if lower.contains("max") {
+            return .max
+        } else if lower.contains("pro") {
+            return .pro
+        } else if lower.contains("4") && lower.contains("anc") {
+            return .gen4Anc
+        } else if lower.contains("4") {
+            return .gen4
+        } else if lower.contains("3") {
+            return .gen3
+        } else if lower.contains("2") {
+            return .gen2
+        } else if lower.contains("1") {
+            return .gen1
+        }
+        return .unknown
     }
 
     public var displayName: String {

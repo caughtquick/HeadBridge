@@ -157,9 +157,9 @@ struct LinuxApp {
             } else if connectedDev.providerID == "sony" && sonyProvider.connectionState == .idle {
                 sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
             } else if connectedDev.providerID == "apple" && appleProvider.connectionState == .idle {
-                appleTransport.connect(address: connectedDev.address, name: connectedDev.name)
+                appleProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
             }
-            for _ in 0..<15 {
+            for _ in 0..<25 {
                 if activeProvider(manager: manager)?.connectionState == .ready { break }
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
@@ -167,12 +167,16 @@ struct LinuxApp {
                 let isSetter = (subcommand == "anc" && filteredArgs.count > 1) ||
                                (subcommand == "eq" && filteredArgs.count > 1)
                 if !isSetter {
-                    for _ in 0..<25 {
-                        if bwProvider.hasConfirmedRead(BWRPCatalog.ancGet) &&
+                    for _ in 0..<30 {
+                        if connectedDev.providerID == "apple" {
+                            if appleProvider.leftBattery != nil || appleProvider.rightBattery != nil || appleProvider.noiseMode != nil {
+                                break
+                            }
+                        } else if bwProvider.hasConfirmedRead(BWRPCatalog.ancGet) &&
                            (bwProvider.supportsToneControls || bwProvider.hasConfirmedRead(BWRPCatalog.eqGet)) {
                             break
                         }
-                        if !bwProvider.hasPendingWrites { break }
+                        if !bwProvider.hasPendingWrites && connectedDev.providerID != "apple" { break }
                         try? await Task.sleep(nanoseconds: 30_000_000)
                     }
                 }
@@ -190,7 +194,7 @@ struct LinuxApp {
 
         case "connect":
             let target = filteredArgs.count > 1 ? filteredArgs[1] : nil
-            let res = await executeConnect(target: target, manager: manager, bwTransport: bwTransport, appleTransport: appleTransport, isJSON: isJSON)
+            let res = await executeConnect(target: target, manager: manager, bwTransport: bwTransport, sonyProvider: sonyProvider, appleProvider: appleProvider, isJSON: isJSON)
             return LinuxIPCResponse(exitCode: res.exitCode, output: res.output)
 
         case "disconnect":
@@ -291,6 +295,9 @@ struct LinuxApp {
         if let provider = provider, isConnected {
             lines.append("Device:        \(provider.connectedName)")
             lines.append("Vendor:        \(provider.vendorName)")
+            if let apple = provider as? AppleAccessoryProvider, apple.appleModel != .unknown {
+                lines.append("Model:         \(apple.appleModel.displayName)")
+            }
             lines.append("State:         \(provider.connectionState.title)")
             let battery = provider.batteryPercent ?? osConnectedDevice.flatMap { LinuxBluetoothInventory.shared.fetchBatteryPercentage(for: $0.address) }
             if let battery = battery {
@@ -337,7 +344,13 @@ struct LinuxApp {
             }
             let sinkName = audio.devices.first(where: { $0.id == audio.defaultDeviceID })?.name ?? "Default"
             lines.append("Audio Output:  \(sinkName)")
-            lines.append("Vendor RPC:    Disconnected (BLE GATT required for ANC/EQ controls)")
+            if osDev.providerID == "apple" {
+                lines.append("Vendor RPC:    Disconnected (L2CAP PSM 0x1001 required for ANC/Telemetry)")
+            } else if osDev.providerID == "sony" {
+                lines.append("Vendor RPC:    Disconnected (RFCOMM required for ANC/EQ controls)")
+            } else {
+                lines.append("Vendor RPC:    Disconnected (BLE GATT required for ANC/EQ controls)")
+            }
         } else {
             lines.append("No supported headphones currently connected.")
             let paired = manager.recognizedDevices
@@ -348,7 +361,7 @@ struct LinuxApp {
                 }
                 lines.append("\nRun 'headbridge connect <address>' to connect.")
             } else {
-                lines.append("No recognized Bowers & Wilkins or Sony devices found in paired Bluetooth inventory.")
+                lines.append("No recognized AirPods, Beats, Bowers & Wilkins, or Sony devices found in paired Bluetooth inventory.")
             }
         }
         return (lines.joined(separator: "\n") + "\n", 0)
@@ -385,7 +398,14 @@ struct LinuxApp {
         return (lines.joined(separator: "\n") + "\n", 0)
     }
 
-    private static func executeConnect(target: String?, manager: HeadphoneManager, bwTransport: LinuxBowersWilkinsTransport, appleTransport: LinuxAppleAccessoryTransport, isJSON: Bool) async -> (output: String, exitCode: Int32) {
+    private static func executeConnect(
+        target: String?,
+        manager: HeadphoneManager,
+        bwTransport: LinuxBowersWilkinsTransport,
+        sonyProvider: SonyMDRProvider,
+        appleProvider: AppleAccessoryProvider,
+        isJSON: Bool
+    ) async -> (output: String, exitCode: Int32) {
         let paired = manager.recognizedDevices
         guard !paired.isEmpty else {
             if isJSON {
@@ -414,12 +434,14 @@ struct LinuxApp {
 
         if device.providerID == "bowers-wilkins" {
             bwTransport.connect(address: device.address, name: device.name)
+        } else if device.providerID == "sony" {
+            sonyProvider.connect(to: BluetoothPairedDevice(id: device.id, name: device.name, address: device.address, isConnected: true, isAudioConnected: true))
         } else if device.providerID == "apple" {
-            appleTransport.connect(address: device.address, name: device.name)
+            appleProvider.connect(to: BluetoothPairedDevice(id: device.id, name: device.name, address: device.address, isConnected: true, isAudioConnected: true))
         }
 
-        for _ in 0..<8 {
-            try? await Task.sleep(nanoseconds: 250_000_000)
+        for _ in 0..<20 {
+            try? await Task.sleep(nanoseconds: 150_000_000)
             if activeProvider(manager: manager)?.connectionState == .ready {
                 break
             }
@@ -434,8 +456,14 @@ struct LinuxApp {
             } else {
                 var out = "Connecting to \(device.name) (\(device.address))...\n"
                 out += "Audio and Battery are connected via BlueZ.\n"
-                out += "Vendor GATT RPC control session is not currently active.\n"
-                out += "Bowers & Wilkins headphones broadcast their ANC/EQ GATT controls over their companion BLE interface ('LE_BWHP').\n"
+                if device.providerID == "apple" {
+                    out += "AirPods L2CAP PSM 0x1001 connection failed. Ensure the AirPods are out of the case, in-ear, and connected to Bluetooth audio.\n"
+                } else if device.providerID == "sony" {
+                    out += "Sony RFCOMM connection failed. Ensure headphones are connected to Bluetooth audio.\n"
+                } else {
+                    out += "Vendor GATT RPC control session is not currently active.\n"
+                    out += "Bowers & Wilkins headphones broadcast their ANC/EQ GATT controls over their companion BLE interface ('LE_BWHP').\n"
+                }
                 return (out, 1)
             }
         }
@@ -591,11 +619,32 @@ struct LinuxApp {
         let isCharging = provider?.isCharging ?? false
 
         if isJSON {
-            return (jsonString(for: ["device": name, "batteryPercent": percent as Any, "isCharging": isCharging]), 0)
+            var dict: [String: Any] = ["device": name, "batteryPercent": percent as Any, "isCharging": isCharging]
+            if let apple = provider as? AppleAccessoryProvider {
+                dict["leftBattery"] = apple.leftBattery?.level
+                dict["rightBattery"] = apple.rightBattery?.level
+                dict["caseBattery"] = apple.caseBattery?.level
+            }
+            return (jsonString(for: dict), 0)
         } else {
             var out = "Device:        \(name)\n"
             out += "Battery:       \(percent.map { "\($0)%" } ?? "Unknown")\n"
             out += "Charging:      \(isCharging ? "Yes" : "No")\n"
+            if let apple = provider as? AppleAccessoryProvider {
+                var podParts: [String] = []
+                if let l = apple.leftBattery, l.status != .disconnected {
+                    podParts.append("L: \(l.level)%\(l.status == .charging ? " ⚡" : "")")
+                }
+                if let r = apple.rightBattery, r.status != .disconnected {
+                    podParts.append("R: \(r.level)%\(r.status == .charging ? " ⚡" : "")")
+                }
+                if let c = apple.caseBattery, c.status != .disconnected {
+                    podParts.append("Case: \(c.level)%\(c.status == .charging ? " ⚡" : "")")
+                }
+                if !podParts.isEmpty {
+                    out += "Pods / Case:   \(podParts.joined(separator: "  |  "))\n"
+                }
+            }
             return (out, 0)
         }
     }
@@ -731,7 +780,7 @@ struct LinuxApp {
                 } else if connectedDev.providerID == "sony" {
                     sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
                 } else if connectedDev.providerID == "apple" {
-                    appleTransport.connect(address: connectedDev.address, name: connectedDev.name)
+                    appleProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
                 }
                 for _ in 0..<30 {
                     if activeProvider(manager: manager)?.connectionState == .ready { break }
@@ -759,7 +808,7 @@ struct LinuxApp {
                 } else if connectedDev.providerID == "sony" && sonyProvider.connectionState == .idle {
                     sonyProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
                 } else if connectedDev.providerID == "apple" && appleProvider.connectionState == .idle {
-                    appleTransport.connect(address: connectedDev.address, name: connectedDev.name)
+                    appleProvider.connect(to: BluetoothPairedDevice(id: connectedDev.id, name: connectedDev.name, address: connectedDev.address, isConnected: true, isAudioConnected: true))
                 }
             }
 

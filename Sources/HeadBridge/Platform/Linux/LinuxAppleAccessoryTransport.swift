@@ -29,6 +29,24 @@ private struct sockaddr_l2 {
     var l2_bdaddr_type: UInt8 = BDADDR_BREDR
 }
 
+private final class AtomicGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func next() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        value &+= 1
+        return value
+    }
+
+    func current() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @MainActor
 protocol AppleAccessoryTransportProtocol: AnyObject {
     var onConnectionStateChange: ((HeadphoneConnectionState) -> Void)? { get set }
@@ -41,6 +59,7 @@ protocol AppleAccessoryTransportProtocol: AnyObject {
 
     func connect(address: String, name: String)
     func disconnect()
+    func send(data: Data) throws
     func send(frame: AAPProtocol.Frame) throws
 }
 
@@ -57,7 +76,7 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
     private let queue = DispatchQueue(label: "io.github.herenickname.HeadBridge.apple-l2cap", qos: .userInitiated)
-    private var generation: UInt64 = 0
+    private let generation = AtomicGeneration()
 
     init() {}
 
@@ -85,8 +104,7 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
         guard connectionState != .ready && connectionState != .connecting else { return }
 
         disconnect()
-        generation &+= 1
-        let currentGeneration = generation
+        let currentGeneration = generation.next()
 
         connectedDeviceAddress = address
         connectedDeviceName = name
@@ -98,17 +116,6 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
             guard let self else { return }
 
             #if os(Linux)
-            let fd = socket(AF_BLUETOOTH, Int32(SOCK_SEQPACKET.rawValue), BTPROTO_L2CAP)
-            guard fd >= 0 else {
-                let err = String(cString: strerror(errno))
-                Task { @MainActor in
-                    guard self.generation == currentGeneration else { return }
-                    self.connectionState = .failed("Failed to create L2CAP socket: \(err)")
-                    self.onConnectionStateChange?(self.connectionState)
-                }
-                return
-            }
-
             var addrBytes: [UInt8] = []
             let hexParts = address.split(separator: ":").reversed()
             for part in hexParts {
@@ -117,9 +124,8 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
                 }
             }
             guard addrBytes.count == 6 else {
-                close(fd)
                 Task { @MainActor in
-                    guard self.generation == currentGeneration else { return }
+                    guard self.generation.current() == currentGeneration else { return }
                     self.connectionState = .failed("Invalid MAC address: \(address)")
                     self.onConnectionStateChange?(self.connectionState)
                 }
@@ -137,30 +143,60 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
                 }
             }
 
-            let connectRes = withUnsafePointer(to: &sa) { saPtr in
-                saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-                    Glibc.connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_l2>.size))
+            // AirPods profile setup on BlueZ can take 1-2 seconds after ACL link is up.
+            // Retry with exponential backoff matching podctl / LibrePods.
+            let retryDelaysMs: [UInt32] = [0, 300, 700, 1200, 2000]
+            var connectedFD: Int32 = -1
+            var lastError = ""
+
+            for (attempt, delayMs) in retryDelaysMs.enumerated() {
+                if delayMs > 0 {
+                    usleep(delayMs * 1000)
+                }
+                guard self.generation.current() == currentGeneration else { return }
+
+                let fd = socket(AF_BLUETOOTH, Int32(SOCK_SEQPACKET.rawValue), BTPROTO_L2CAP)
+                if fd < 0 {
+                    lastError = String(cString: strerror(errno))
+                    continue
+                }
+
+                let connectRes = withUnsafePointer(to: &sa) { saPtr in
+                    saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                        Glibc.connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_l2>.size))
+                    }
+                }
+
+                if connectRes == 0 {
+                    connectedFD = fd
+                    break
+                } else {
+                    let errStr = String(cString: strerror(errno))
+                    lastError = errStr
+                    close(fd)
+                    Task { @MainActor in
+                        guard self.generation.current() == currentGeneration else { return }
+                        self.onLog?(.outgoing, "L2CAP connect attempt \(attempt + 1) failed (\(errStr)), retrying...")
+                    }
                 }
             }
 
-            if connectRes != 0 {
-                let err = String(cString: strerror(errno))
-                close(fd)
+            guard connectedFD >= 0 else {
                 Task { @MainActor in
-                    guard self.generation == currentGeneration else { return }
-                    self.connectionState = .failed("L2CAP connect error: \(err)")
+                    guard self.generation.current() == currentGeneration else { return }
+                    self.connectionState = .failed("L2CAP connect failed after retries: \(lastError)")
                     self.onConnectionStateChange?(self.connectionState)
                 }
                 return
             }
 
             Task { @MainActor in
-                guard self.generation == currentGeneration else {
-                    close(fd)
+                guard self.generation.current() == currentGeneration else {
+                    close(connectedFD)
                     return
                 }
-                self.socketFD = fd
-                self.setupReader(fd: fd, generation: currentGeneration)
+                self.socketFD = connectedFD
+                self.setupReader(fd: connectedFD, generation: currentGeneration)
                 self.connectionState = .ready
                 self.onConnectionStateChange?(.ready)
                 self.onLog?(.incoming, "L2CAP connection established")
@@ -175,7 +211,7 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
     }
 
     func disconnect() {
-        generation &+= 1
+        _ = generation.next()
         cleanup()
         if connectionState != .idle {
             connectionState = .idle
@@ -186,18 +222,15 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
         connectedDeviceName = nil
     }
 
-    func send(frame: AAPProtocol.Frame) throws {
+    func send(data: Data) throws {
         guard connectionState == .ready, socketFD >= 0 else {
             throw TransportError.notConnected
         }
 
-        let encoded = frame.encode()
-        onLog?(.outgoing, "AAP frame opcode=0x\(String(format: "%02X", frame.opcode)) len=\(encoded.count)")
-
         #if os(Linux)
-        let written = encoded.withUnsafeBytes { ptr -> Int in
+        let written = data.withUnsafeBytes { ptr -> Int in
             guard let baseAddress = ptr.baseAddress else { return -1 }
-            return Glibc.write(socketFD, baseAddress, encoded.count)
+            return Glibc.write(socketFD, baseAddress, data.count)
         }
 
         if written < 0 {
@@ -206,6 +239,12 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
             throw TransportError.writeFailed(err)
         }
         #endif
+    }
+
+    func send(frame: AAPProtocol.Frame) throws {
+        let encoded = frame.encode()
+        onLog?(.outgoing, "AAP frame opcode=0x\(String(format: "%02X", frame.opcode)) subop=0x\(String(format: "%02X", frame.subop)) len=\(encoded.count)")
+        try send(data: encoded)
     }
 
     private func setupReader(fd: Int32, generation: UInt64) {
@@ -220,7 +259,7 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
             if bytesRead > 0 {
                 let packetData = Data(buffer[0..<bytesRead])
                 Task { @MainActor in
-                    guard self.generation == generation else { return }
+                    guard self.generation.current() == generation else { return }
                     if let frame = AAPProtocol.Frame.parse(packetData) {
                         self.onLog?(.incoming, "AAP frame opcode=0x\(String(format: "%02X", frame.opcode)) subop=0x\(String(format: "%02X", frame.subop)) len=\(packetData.count)")
                         self.onFrameReceived?(frame)
@@ -230,7 +269,7 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
                 }
             } else if bytesRead == 0 {
                 Task { @MainActor in
-                    guard self.generation == generation else { return }
+                    guard self.generation.current() == generation else { return }
                     self.onLog?(.incoming, "Remote closed L2CAP connection")
                     self.disconnect()
                 }
@@ -238,7 +277,7 @@ final class LinuxAppleAccessoryTransport: AppleAccessoryTransportProtocol {
                 let err = errno
                 if err != EAGAIN && err != EWOULDBLOCK {
                     Task { @MainActor in
-                        guard self.generation == generation else { return }
+                        guard self.generation.current() == generation else { return }
                         self.onLog?(.incoming, "Read error: \(String(cString: strerror(err)))")
                         self.disconnect()
                     }
